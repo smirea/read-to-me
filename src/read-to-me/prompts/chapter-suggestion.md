@@ -12,19 +12,20 @@ Aim for chapters that are:
 - Not too granular (avoid splitting every paragraph)
 
 Respond with a JSON array of chapter suggestions. Each suggestion should have:
-- "title": A short descriptive title (2-5 words) for the chapter
-- "startPhrase": The exact first 50-100 characters where this chapter should start (must match text exactly)
+- "title": A short descriptive title (2-10 words) for the chapter
+- "startPhrase": Copy-paste the EXACT first 10-20 words where this chapter starts
 
 The first chapter should start at the beginning of the content.
 
 Example response format:
 [
-  {"title": "Introduction", "startPhrase": "The history of artificial intelligence"},
-  {"title": "Early Research", "startPhrase": "In the 1950s, researchers at Dartmouth"},
-  {"title": "Modern Advances", "startPhrase": "The breakthrough came in 2012 when"}
+  {"title": "Introduction", "startPhrase": "The history of artificial intelligence begins"},
+  {"title": "Early Research", "startPhrase": "In the 1950s, researchers at Dartmouth College"},
+  {"title": "Modern Advances", "startPhrase": "The breakthrough came in 2012 when a neural"}
 ]
 
-IMPORTANT:
+CRITICAL REQUIREMENTS:
 - Return ONLY valid JSON, no other text
-- The startPhrase MUST be copied exactly from the content (including punctuation)
-- Suggest 3-10 chapters depending on content length
+- The startPhrase MUST be COPY-PASTED verbatim from the content - do NOT paraphrase or summarize
+- Do NOT invent or modify any words - if the text says "Step 3:" you must include the colon
+- Suggest as many chapters as necessary based on the topics discussed

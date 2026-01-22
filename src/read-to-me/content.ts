@@ -183,7 +183,7 @@ async function filterChapterContent(chapter: Chapter): Promise<Chapter> {
 }
 
 export async function filterContentWithAI(content: ExtractedContent): Promise<ExtractedContent> {
-    console.log(chalk.blue(`Filtering ${content.chapters.length} chapters with Gemini 3 Flash (concurrency: ${GEMINI_CONCURRENCY})...`));
+    console.log(chalk.blue(`Filtering ${content.chapters.length} chapters (concurrency: ${GEMINI_CONCURRENCY})...`));
 
     let completed = 0;
     const total = content.chapters.length;

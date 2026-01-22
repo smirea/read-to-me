@@ -9,10 +9,10 @@ import { env } from '../config';
 export const claudeSonnetModel = anthropic('claude-sonnet-4-5');
 
 /** Gemini 3 Flash model for image description, chapters, tables, summary, content filtering */
-export const geminiFlashModel = google('gemini-3-flash');
+export const geminiFlashModel = google('gemini-3-flash-preview');
 
 /** Gemini client for image generation (Gemini 2.5 Flash Image) */
-export const geminiImageGenClient = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
+export const geminiImageGenClient = new GoogleGenAI({ apiKey: env.GOOGLE_GENERATIVE_AI_API_KEY });
 
 /** Google Cloud Text-to-Speech client */
 export const ttsClient = new TextToSpeechClient();

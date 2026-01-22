@@ -13,7 +13,7 @@ bun src/read-to-me.ts <url> [options]
 ### Features
 
 - Extracts article content via Mozilla Readability
-- AI-powered filtering of ads/comments (Gemini 2.0 Flash)
+- AI-powered filtering of ads/comments (Gemini)
 - AI image descriptions for richer listening (skips stock photos)
 - AI table analysis with narrative insights
 - Speech enhancement with SSML for natural-sounding audio

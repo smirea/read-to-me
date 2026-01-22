@@ -226,7 +226,7 @@ Article context: ${contentPreview}`;
 
             const response = await withRetry(
                 () => geminiImageGenClient!.models.generateContent({
-                    model: 'gemini-2.5-flash-image',
+                    model: 'gemini-3-pro-image-preview',
                     contents: prompt,
                     config: {
                         responseModalities: ['IMAGE'],
@@ -251,7 +251,7 @@ Article context: ${contentPreview}`;
 
     // Fall back to using an article image
     if (!baseImage && content.allImages.length > 0) {
-        console.log(chalk.gray('  Falling back to article image (rating with Gemini 3 Flash)...'));
+        console.log(chalk.gray('  Falling back to article image...'));
         try {
             const imagesToRate = content.allImages.slice(0, 5);
 

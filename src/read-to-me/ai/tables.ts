@@ -40,7 +40,7 @@ export async function processTablesInContent(content: ExtractedContent): Promise
         return content;
     }
 
-    console.log(chalk.blue(`Processing ${content.allTables.length} table(s) with Gemini 3 Flash (concurrency: ${GEMINI_CONCURRENCY})...`));
+    console.log(chalk.blue(`Processing ${content.allTables.length} table(s) (concurrency: ${GEMINI_CONCURRENCY})...`));
 
     const tableResults: Array<{ cells: string[]; description: string }> = [];
     let completed = 0;

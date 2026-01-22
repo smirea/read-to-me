@@ -189,7 +189,7 @@ function extractContextForImage(content: string, imageUrl: string, charsBefore =
 
 export async function processImagesInContent(content: ExtractedContent): Promise<ExtractedContent> {
     const cacheInfo = argv['cache-images'] ? ' (cache enabled)' : '';
-    console.log(chalk.blue(`Processing ${content.allImages.length} images with Gemini 3 Flash (concurrency: ${GEMINI_CONCURRENCY})${cacheInfo}...`));
+    console.log(chalk.blue(`Processing ${content.allImages.length} images (concurrency: ${GEMINI_CONCURRENCY})${cacheInfo}...`));
 
     const imageDescriptions = new Map<string, string>();
     let completed = 0;

@@ -16,7 +16,7 @@ async function loadPrompt(): Promise<string> {
 }
 
 export async function generateSummary(content: ExtractedContent): Promise<string> {
-    console.log(chalk.blue('Generating article summary with Gemini 3 Flash...'));
+    console.log(chalk.blue('Generating article summary...'));
 
     try {
         const prompt = await loadPrompt();
