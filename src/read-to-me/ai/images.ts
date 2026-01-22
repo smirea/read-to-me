@@ -187,7 +187,12 @@ function extractContextForImage(content: string, imageUrl: string, charsBefore =
     return context.length > 50 ? context : undefined;
 }
 
-export async function processImagesInContent(content: ExtractedContent): Promise<ExtractedContent> {
+export interface ProcessImagesResult {
+    content: ExtractedContent;
+    imageDescriptions: Map<string, string>;
+}
+
+export async function processImagesInContent(content: ExtractedContent): Promise<ProcessImagesResult> {
     const cacheInfo = argv['cache-images'] ? ' (cache enabled)' : '';
     console.log(chalk.blue(`Processing ${content.allImages.length} images (concurrency: ${GEMINI_CONCURRENCY})${cacheInfo}...`));
 
@@ -272,5 +277,8 @@ export async function processImagesInContent(content: ExtractedContent): Promise
         return { ...chapter, content: updatedContent, chapterImageUrl };
     });
 
-    return { ...content, chapters: updatedChapters };
+    return {
+        content: { ...content, chapters: updatedChapters },
+        imageDescriptions,
+    };
 }

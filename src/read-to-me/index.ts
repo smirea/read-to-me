@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import chalk from 'chalk';
-import { unlink, rename } from 'fs/promises';
+import { rm, unlink } from 'fs/promises';
 import path from 'path';
 import pLimit from 'p-limit';
 
@@ -32,10 +32,10 @@ import { synthesizeContent } from './audio';
 import { generateThumbnail } from './thumbnail';
 
 // Output
-import { generateFfmetadata, generateMarkdown, generateRssFeed, generateJsonChapters, updateMasterFeed } from './output';
+import { generateFfmetadata, generateMarkdown, generateRssFeed, generateJsonChapters, updateMasterFeed, getNextEpisodeNumber, findExistingEpisode } from './output';
 
 // Upload
-import { uploadToGCS } from './upload';
+import { uploadToGCS, deleteGCSFolder } from './upload';
 
 const fetchLimit = pLimit(FETCH_CONCURRENCY);
 
@@ -82,9 +82,9 @@ void createScript(async () => {
     console.log();
     const baseSummary = await generateSummary(content);
 
-    // Build narrator attribution and prepend to summary
+    // Build narrator attribution
     const narrator = buildNarratorAttribution(voice, dialect);
-    const summary = `${narrator}. ${baseSummary}`;
+    const summary = `${baseSummary}\n\nSource: ${url}\n\nNarrated by ${narrator}`;
 
     // Update summary after processing
     console.log();
@@ -114,8 +114,37 @@ void createScript(async () => {
     console.log();
     const chapterAudios = await synthesizeContent(content, voice, dialect);
 
-    // Step 7: Save individual chapter files and generate output
-    const titleSlug = content.title.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+    // Step 7: Get episode number and save files
+    const masterFeedUrl = `${GCS_BASE_URL}/read-to-me/feed.xml`;
+    const rawSlug = content.title.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+
+    // Check if this URL has been processed before
+    const existingEpisode = await findExistingEpisode(masterFeedUrl, url);
+    let episodeNumber: string;
+    let titleSlug: string;
+
+    if (existingEpisode) {
+        // Re-processing: use existing episode number and slug
+        episodeNumber = String(existingEpisode.episodeNumber).padStart(3, '0');
+        titleSlug = existingEpisode.slug;
+        console.log(`  Episode: #${existingEpisode.episodeNumber} (re-processing)`);
+
+        // Delete old local output directory if it exists
+        const oldOutputDir = path.join(process.cwd(), 'output', titleSlug);
+        try {
+            await rm(oldOutputDir, { recursive: true, force: true });
+            console.log(chalk.yellow(`  Deleted old output: ${oldOutputDir}`));
+        } catch {
+            // Directory might not exist locally
+        }
+    } else {
+        // New episode
+        const nextEpisodeNumber = await getNextEpisodeNumber(masterFeedUrl);
+        episodeNumber = String(nextEpisodeNumber).padStart(3, '0');
+        titleSlug = `${episodeNumber}_${rawSlug}`;
+        console.log(`  Episode: #${nextEpisodeNumber} (new)`);
+    }
+
     const outputDir = output
         ? path.resolve(output)
         : path.join(process.cwd(), 'output', titleSlug);
@@ -127,19 +156,10 @@ void createScript(async () => {
     console.log(style.header('Saving Audio Files'));
     console.log(`  Output directory: ${outputDir}`);
 
-    // Save individual chapter MP3s
-    for (let i = 0; i < chapterAudios.length; i++) {
-        const audio = chapterAudios[i];
-        const filename = `${String(i + 1).padStart(2, '0')}-${audio.title.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.mp3`;
-        const filepath = path.join(outputDir, filename);
-        await Bun.write(filepath, audio.audioBuffer);
-        console.log(chalk.green(`  ✓ ${filename}`));
-    }
-
     // Create combined audio file with embedded chapter metadata (M4A format)
     const combinedBuffer = Buffer.concat(chapterAudios.map(a => a.audioBuffer));
-    const tempMp3Path = path.join(outputDir, `${outputBase}.temp.mp3`);
-    await Bun.write(tempMp3Path, combinedBuffer);
+    const tempPcmPath = path.join(outputDir, `${outputBase}.temp.pcm`);
+    await Bun.write(tempPcmPath, combinedBuffer);
 
     // Calculate chapter timestamps
     let currentTime = 0;
@@ -164,21 +184,19 @@ void createScript(async () => {
     const combinedPath = path.join(outputDir, `${outputBase}.m4a`);
     console.log(chalk.gray('  Converting to M4A with embedded chapters...'));
 
-    // Use -map_chapters 1 to properly map chapter metadata from the ffmetadata file
-    // Use -movflags +faststart for better streaming compatibility
-    // Note: The order of flags matters - -map 0 ensures we take audio from first input,
-    // -map_chapters 1 takes chapters from second input (ffmetadata file)
-    const ffmpegResult = await Bun.$`ffmpeg -y -i ${tempMp3Path} -f ffmetadata -i ${ffmetadataPath} -map 0:a -map_chapters 1 -map_metadata 1 -c:a aac -b:a 192k -movflags +faststart ${combinedPath}`.quiet();
+    // PCM input flags: -f s16le (signed 16-bit little-endian), -ar 24000 (sample rate), -ac 1 (mono)
+    // -map 0:a takes audio from first input, -map_chapters 1 takes chapters from ffmetadata file
+    const ffmpegResult = await Bun.$`ffmpeg -y -f s16le -ar 24000 -ac 1 -i ${tempPcmPath} -f ffmetadata -i ${ffmetadataPath} -map 0:a -map_chapters 1 -map_metadata 1 -c:a aac -b:a 192k -movflags +faststart ${combinedPath}`.quiet();
     if (ffmpegResult.exitCode !== 0) {
-        console.log(chalk.yellow('  ⚠ ffmpeg conversion failed, keeping MP3 format'));
-        const mp3Path = path.join(outputDir, `${outputBase}.mp3`);
-        await rename(tempMp3Path, mp3Path);
-    } else {
-        // Clean up temp files
-        await unlink(tempMp3Path);
-        await unlink(ffmetadataPath);
-        console.log(chalk.green.bold(`  ✓ ${outputBase}.m4a (combined with chapters)`));
+        console.log(chalk.red('  ✗ ffmpeg conversion failed'));
+        console.log(chalk.gray(ffmpegResult.stderr.toString()));
+        await unlink(tempPcmPath).catch(() => {});
+        throw new Error('Failed to convert audio to M4A');
     }
+    // Clean up temp files
+    await unlink(tempPcmPath);
+    await unlink(ffmetadataPath);
+    console.log(chalk.green.bold(`  ✓ ${outputBase}.m4a (combined with chapters)`));
 
     // Generate chapter metadata JSON file
     const metadataPath = path.join(outputDir, 'chapters.json');
@@ -255,6 +273,13 @@ void createScript(async () => {
         console.log(style.header('Uploading to GCS'));
 
         const gcsPath = `read-to-me/${titleSlug}`;
+
+        // Delete old GCS assets if re-processing
+        if (existingEpisode) {
+            console.log(chalk.gray(`  Deleting old GCS assets...`));
+            const deletedCount = await deleteGCSFolder(GCS_BUCKET, `${gcsPath}/`);
+            console.log(chalk.yellow(`  Deleted ${deletedCount} old files from GCS`));
+        }
 
         // Upload M4A audio file
         console.log(chalk.gray(`  Uploading audio file...`));

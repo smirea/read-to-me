@@ -82,6 +82,18 @@ export interface ThumbnailCacheMetadata {
     contentHash: string;
 }
 
+export interface ProcessedImage {
+    originalUrl: string;
+    gcsUrl: string;
+    description: string;
+    chapterIndex: number;
+}
+
+export interface ChapterImageData {
+    gcsUrl: string;
+    description: string;
+}
+
 export interface RssFeedOptions {
     title: string;
     author: string;
@@ -91,6 +103,12 @@ export interface RssFeedOptions {
     thumbnailUrl: string;
     audioSizeBytes: number;
     durationMs: number;
-    chapters: Array<{ title: string; startMs: number; imageUrl?: string }>;
+    chapters: Array<{
+        title: string;
+        startMs: number;
+        imageUrl?: string;
+        pageUrl?: string;
+        images?: ChapterImageData[];
+    }>;
     chaptersJsonUrl?: string;
 }

@@ -6,6 +6,9 @@ export const GEMINI_CONCURRENCY = 5;
 export const TTS_CONCURRENCY = 5;
 export const FETCH_CONCURRENCY = 10;
 
+// TTS audio configuration
+export const TTS_SAMPLE_RATE = 24000;
+
 // GCS configuration
 export const GCS_BUCKET = env.GCS_BUCKET;
 export const GCS_BASE_URL = _GCS_BASE_URL;

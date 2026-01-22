@@ -1,27 +1,20 @@
 import chalk from 'chalk';
-import { unlink } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
 import pLimit from 'p-limit';
 import { withRetry } from '../utils/retry';
 import { ttsClient } from './clients';
-import { TTS_CONCURRENCY } from './constants';
+import { TTS_CONCURRENCY, TTS_SAMPLE_RATE } from './constants';
 import { parseChapterIntoSegments } from './segments';
 import type { Chapter, ChapterAudio, ChapterWithSegments, ContentSegment, ExtractedContent } from './types';
 import { getOppositeGenderVoice, type EnglishDialect, type Voice } from './voice';
 
 const ttsLimit = pLimit(TTS_CONCURRENCY);
 
-async function getAudioDurationMs(buffer: Buffer): Promise<number> {
-    const tempPath = join(tmpdir(), `audio-${Date.now()}-${Math.random().toString(36).slice(2)}.mp3`);
-    await Bun.write(tempPath, buffer);
-    try {
-        const result = await Bun.$`ffprobe -v error -show_entries format=duration -of csv=p=0 ${tempPath}`.quiet();
-        const seconds = parseFloat(result.text().trim());
-        return Math.round(seconds * 1000);
-    } finally {
-        await unlink(tempPath).catch(() => {});
-    }
+function getAudioDurationMs(buffer: Buffer): number {
+    const bytesPerSample = 2; // LINEAR16 = 16-bit = 2 bytes
+    const channels = 1; // mono
+    const totalSamples = buffer.length / (bytesPerSample * channels);
+    const durationSeconds = totalSamples / TTS_SAMPLE_RATE;
+    return Math.round(durationSeconds * 1000);
 }
 
 // =============================================================================
@@ -277,7 +270,8 @@ async function synthesizeSegment(
                             name: `${dialect}-Chirp3-HD-${selectedVoice}`,
                         },
                         audioConfig: {
-                            audioEncoding: 'MP3',
+                            audioEncoding: 'LINEAR16',
+                            sampleRateHertz: TTS_SAMPLE_RATE,
                             speakingRate: 0.85,
                         },
                     }),
@@ -339,7 +333,7 @@ async function synthesizeChapterWithSegments(
     }
 
     const audioBuffer = Buffer.concat(audioBuffers);
-    const durationMs = await getAudioDurationMs(audioBuffer);
+    const durationMs = getAudioDurationMs(audioBuffer);
 
     console.log(chalk.green(`    → ${(audioBuffer.length / 1024).toFixed(1)} KB, ${(durationMs / 1000).toFixed(1)}s`));
 
@@ -385,7 +379,8 @@ async function synthesizeChapter(
                         name: `${dialect}-Chirp3-HD-${voice}`,
                     },
                     audioConfig: {
-                        audioEncoding: 'MP3',
+                        audioEncoding: 'LINEAR16',
+                        sampleRateHertz: TTS_SAMPLE_RATE,
                         speakingRate: 0.85,
                     },
                 }),
@@ -407,7 +402,7 @@ async function synthesizeChapter(
         .map(r => r.buffer as Buffer);
 
     const audioBuffer = Buffer.concat(audioBuffers);
-    const durationMs = await getAudioDurationMs(audioBuffer);
+    const durationMs = getAudioDurationMs(audioBuffer);
 
     const ssmlTag = isSSML ? chalk.cyan(' [SSML]') : '';
     console.log(chalk.green(`    → ${(audioBuffer.length / 1024).toFixed(1)} KB, ${(durationMs / 1000).toFixed(1)}s${ssmlTag}`));

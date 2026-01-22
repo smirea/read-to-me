@@ -18,3 +18,18 @@ export async function uploadToGCS(localPath: string, gcsPath: string, contentTyp
         ...(contentType && { contentType }),
     });
 }
+
+/**
+ * Delete all files in a GCS folder (prefix).
+ * @param bucketName - The bucket name
+ * @param prefix - The folder prefix to delete (e.g., "read-to-me/005_some-title/")
+ */
+export async function deleteGCSFolder(bucketName: string, prefix: string): Promise<number> {
+    const bucket = gcsClient.bucket(bucketName);
+    const [files] = await bucket.getFiles({ prefix });
+
+    if (files.length === 0) return 0;
+
+    await Promise.all(files.map(file => file.delete()));
+    return files.length;
+}
