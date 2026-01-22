@@ -10,7 +10,7 @@ import { formatMs } from '../utils/time';
 
 import { argv } from './cli';
 import { FETCH_CONCURRENCY, GCS_BASE_URL, GCS_BUCKET } from './constants';
-import type { ChapterMetadata, EpisodeData } from './types';
+import type { ChapterImageData, ChapterMetadata, EpisodeData } from './types';
 import { buildNarratorAttribution, resolveVoice, VOICE_GENDERS, type EnglishDialect } from './voice';
 
 // Content
@@ -32,7 +32,8 @@ import { synthesizeContent } from './audio';
 import { generateThumbnail } from './thumbnail';
 
 // Output
-import { generateFfmetadata, generateMarkdown, generateRssFeed, generateJsonChapters, updateMasterFeed, getNextEpisodeNumber, findExistingEpisode } from './output';
+import { generateFfmetadata, generateMarkdown, generateRssFeed, generateJsonChapters, updateMasterFeed, getNextEpisodeNumber, findExistingEpisode, buildDescriptionWithImages } from './output';
+import { generateChapterHtml } from './output/chapter-html';
 
 // Upload
 import { uploadToGCS, deleteGCSFolder } from './upload';
@@ -94,10 +95,17 @@ void createScript(async () => {
         console.log(`    - ${chapter.title} (${chapter.content.length} chars)`);
     }
 
+    // Store content BEFORE image processing for chapter HTML pages (with original markdown images)
+    const contentForHtmlPages = structuredClone(content);
+
     // Step 4: Process images with Gemini
+    // Store image descriptions for later use in episode description and HTML pages
+    let imageDescriptions = new Map<string, string>();
     if (content.allImages.length > 0) {
         console.log();
-        content = await processImagesInContent(content);
+        const imageResult = await processImagesInContent(content);
+        content = imageResult.content;
+        imageDescriptions = imageResult.imageDescriptions;
     }
 
     // Step 5: Process tables with Gemini
@@ -291,39 +299,127 @@ void createScript(async () => {
         await uploadToGCS(thumbnailPath, `${GCS_BUCKET}/${gcsPath}/thumbnail.png`, 'image/png');
         console.log(chalk.green(`  ✓ thumbnail.png`));
 
-        // Upload chapter images and track their GCS URLs
-        const chapterImageUrls: Map<number, string> = new Map();
-        const chaptersWithImages = content.chapters
-            .map((c, i) => ({ index: i, imageUrl: c.chapterImageUrl }))
-            .filter((c): c is { index: number; imageUrl: string } => !!c.imageUrl);
+        // Upload ALL images from chapters and track their GCS URLs with descriptions
+        // This includes the chapter artwork image AND all other images in each chapter
+        const chapterImageUrls: Map<number, string> = new Map(); // For chapter artwork
+        const allChapterImages: Map<number, ChapterImageData[]> = new Map(); // All images per chapter
 
-        if (chaptersWithImages.length > 0) {
-            console.log(chalk.gray(`  Uploading ${chaptersWithImages.length} chapter images...`));
-            for (const { index, imageUrl } of chaptersWithImages) {
+        // Collect all unique images per chapter
+        const allImageUrlsToUpload = new Set<string>();
+        const imageUrlToChapterIndices = new Map<string, number[]>();
+
+        for (let i = 0; i < contentForHtmlPages.chapters.length; i++) {
+            const chapter = contentForHtmlPages.chapters[i];
+            allChapterImages.set(i, []);
+            for (const imgUrl of chapter.images) {
+                // Only include images that have descriptions (not skipped)
+                if (imageDescriptions.has(imgUrl)) {
+                    allImageUrlsToUpload.add(imgUrl);
+                    const indices = imageUrlToChapterIndices.get(imgUrl) || [];
+                    indices.push(i);
+                    imageUrlToChapterIndices.set(imgUrl, indices);
+                }
+            }
+        }
+
+        // Upload images and build GCS URL mapping
+        const imageUrlToGcsUrl = new Map<string, string>();
+        if (allImageUrlsToUpload.size > 0) {
+            console.log(chalk.gray(`  Uploading ${allImageUrlsToUpload.size} article images...`));
+            let imgIndex = 0;
+            for (const imgUrl of allImageUrlsToUpload) {
+                imgIndex++;
                 try {
-                    const response = await fetchWithUA(imageUrl);
+                    const response = await fetchWithUA(imgUrl);
                     if (response.ok) {
                         const contentType = response.headers.get('content-type') || 'image/jpeg';
                         const ext = contentType.includes('png') ? 'png'
                             : contentType.includes('gif') ? 'gif'
                             : contentType.includes('webp') ? 'webp'
                             : 'jpg';
-                        const chapterImageFilename = `chapter-${index + 1}.${ext}`;
-                        const chapterImagePath = path.join(outputDir, 'images', chapterImageFilename);
+                        const imageFilename = `image-${String(imgIndex).padStart(2, '0')}.${ext}`;
+                        const imagePath = path.join(outputDir, 'images', imageFilename);
                         const arrayBuffer = await response.arrayBuffer();
-                        await Bun.write(chapterImagePath, Buffer.from(arrayBuffer));
+                        await Bun.write(imagePath, Buffer.from(arrayBuffer));
 
-                        const gcsImagePath = `${GCS_BUCKET}/${gcsPath}/images/${chapterImageFilename}`;
-                        await uploadToGCS(chapterImagePath, gcsImagePath, contentType);
+                        const gcsImagePath = `${GCS_BUCKET}/${gcsPath}/images/${imageFilename}`;
+                        await uploadToGCS(imagePath, gcsImagePath, contentType);
 
-                        const gcsImageUrl = `${GCS_BASE_URL}/${gcsPath}/images/${chapterImageFilename}`;
-                        chapterImageUrls.set(index, gcsImageUrl);
-                        console.log(chalk.green(`  ✓ chapter-${index + 1} image`));
+                        const gcsUrl = `${GCS_BASE_URL}/${gcsPath}/images/${imageFilename}`;
+                        imageUrlToGcsUrl.set(imgUrl, gcsUrl);
+                        console.log(chalk.green(`  ✓ ${imageFilename}`));
                     }
                 } catch {
-                    console.log(chalk.yellow(`  ⚠ Could not upload chapter ${index + 1} image`));
+                    console.log(chalk.yellow(`  ⚠ Could not upload image ${imgIndex}`));
                 }
             }
+        }
+
+        // Build chapter image data with GCS URLs
+        for (let i = 0; i < contentForHtmlPages.chapters.length; i++) {
+            const chapter = contentForHtmlPages.chapters[i];
+            const chapterImages: ChapterImageData[] = [];
+
+            for (const imgUrl of chapter.images) {
+                const gcsUrl = imageUrlToGcsUrl.get(imgUrl);
+                const description = imageDescriptions.get(imgUrl);
+                if (gcsUrl && description) {
+                    chapterImages.push({ gcsUrl, description });
+
+                    // Set first image as chapter artwork
+                    if (!chapterImageUrls.has(i)) {
+                        chapterImageUrls.set(i, gcsUrl);
+                    }
+                }
+            }
+            allChapterImages.set(i, chapterImages);
+        }
+
+        // Generate and upload chapter HTML pages
+        console.log(chalk.gray(`  Generating chapter HTML pages...`));
+        const chapterPageUrls: Map<number, string> = new Map();
+        const allChapterPageInfo = chapters.map((c, i) => ({
+            title: c.title,
+            pageUrl: `${GCS_BASE_URL}/${gcsPath}/chapter-${i + 1}.html`,
+        }));
+
+        for (let i = 0; i < chapters.length; i++) {
+            const chapter = chapters[i];
+            const originalChapter = contentForHtmlPages.chapters[i];
+
+            // Build images array with original URL, GCS URL, and description
+            const imagesForHtml = originalChapter.images
+                .map(originalUrl => {
+                    const gcsUrl = imageUrlToGcsUrl.get(originalUrl);
+                    const description = imageDescriptions.get(originalUrl);
+                    if (gcsUrl && description) {
+                        return { originalUrl, gcsUrl, description };
+                    }
+                    return null;
+                })
+                .filter((img): img is { originalUrl: string; gcsUrl: string; description: string } => img !== null);
+
+            const chapterHtml = generateChapterHtml({
+                episodeTitle: content.title,
+                chapterTitle: chapter.title,
+                content: originalChapter.content,
+                images: imagesForHtml,
+                chapterIndex: i,
+                totalChapters: chapters.length,
+                sourceUrl: url,
+                allChapters: allChapterPageInfo,
+            });
+
+            const chapterHtmlFilename = `chapter-${i + 1}.html`;
+            const chapterHtmlPath = path.join(outputDir, chapterHtmlFilename);
+            await Bun.write(chapterHtmlPath, chapterHtml);
+
+            const gcsHtmlPath = `${GCS_BUCKET}/${gcsPath}/${chapterHtmlFilename}`;
+            await uploadToGCS(chapterHtmlPath, gcsHtmlPath, 'text/html');
+
+            const chapterPageUrl = `${GCS_BASE_URL}/${gcsPath}/${chapterHtmlFilename}`;
+            chapterPageUrls.set(i, chapterPageUrl);
+            console.log(chalk.green(`  ✓ ${chapterHtmlFilename}`));
         }
 
         // Generate and upload RSS feed
@@ -335,12 +431,22 @@ void createScript(async () => {
         // Get audio file size for enclosure
         const audioStats = Bun.file(combinedPath).size;
 
-        // Build chapters with image URLs for RSS
+        // Build chapters with image URLs and page URLs for RSS
         const chaptersForRss = chapters.map((c, i) => ({
             title: c.title,
             startMs: c.startMs,
             imageUrl: chapterImageUrls.get(i),
+            pageUrl: chapterPageUrls.get(i),
+            images: allChapterImages.get(i),
         }));
+
+        // Build enhanced description with image references
+        const descriptionChapters = chapters.map((c, i) => ({
+            title: c.title,
+            startMs: c.startMs,
+            images: allChapterImages.get(i) || [],
+        }));
+        const enhancedSummary = buildDescriptionWithImages(summary, descriptionChapters);
 
         // Generate Podcasting 2.0 JSON chapters file
         const jsonChapters = generateJsonChapters(chaptersForRss, url);
@@ -355,7 +461,7 @@ void createScript(async () => {
         const rssFeed = generateRssFeed({
             title: content.title,
             author: content.byline || 'Read To Me',
-            summary,
+            summary: enhancedSummary,
             sourceUrl: url,
             audioUrl,
             thumbnailUrl,
@@ -380,7 +486,7 @@ void createScript(async () => {
         const newEpisode: EpisodeData = {
             title: content.title,
             author: content.byline || 'Read To Me',
-            summary,
+            summary: enhancedSummary,
             sourceUrl: url,
             audioUrl,
             thumbnailUrl,
