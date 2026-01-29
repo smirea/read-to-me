@@ -1,8 +1,4 @@
-# Scripts
-
-Utility scripts built with Bun and TypeScript.
-
-## read-to-me
+# Read To Me
 
 Converts web articles into audio using Google's Chirp 3 HD text-to-speech. Like NotebookLM but just reads articles aloud.
 
@@ -61,6 +57,14 @@ When uploaded (default), also updates the master RSS feed at:
 ### Setup
 
 1. Install dependencies: `bun install`
-2. Set `GEMINI_API_KEY` environment variable
-3. Create GCP service account key at `gcp-key.json` with Text-to-Speech API enabled
-4. For RSS uploads: configure GCS bucket `stefan-rss-feed` with public read access
+2. Set required environment variables (see `src/config.ts`):
+   - `ANTHROPIC_API_KEY`
+   - `GOOGLE_GENERATIVE_AI_API_KEY`
+   - `GCS_BUCKET`
+3. Add your GCP Text-to-Speech service account key at `gcp-key.json`
+4. Configure the GCS bucket (default: `stefan-rss-feed`) with public read access for RSS + media uploads
+
+### Development
+
+- `bun run start <url>`: run once
+- `bun run dev`: auto-reload while editing `src/read-to-me.ts`

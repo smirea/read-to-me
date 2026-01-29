@@ -1,10 +1,12 @@
 {
-    "name": "scripts",
+    "name": "read-to-me",
+    "description": "Turn any article into an AI-generated podcast episode with chapters, thumbnails, and RSS feeds.",
     "private": true,
     "scripts": {
         "lint": "oxlint --fix --type-aware",
         "test": "bun test",
-        "dev": "bun --watch src/index.ts"
+        "dev": "bun --watch src/read-to-me.ts",
+        "start": "bun src/read-to-me.ts"
     },
     "dependencies": {
         "@ai-sdk/anthropic": "^3.0.23",

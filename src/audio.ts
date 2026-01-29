@@ -1,6 +1,6 @@
 import chalk from 'chalk';
 import pLimit from 'p-limit';
-import { withRetry } from '../utils/retry';
+import { withRetry } from './utils/retry';
 import { ttsClient } from './clients';
 import { TTS_CONCURRENCY, TTS_SAMPLE_RATE } from './constants';
 import { parseChapterIntoSegments } from './segments';

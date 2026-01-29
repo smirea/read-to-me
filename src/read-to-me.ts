@@ -4,9 +4,9 @@ import { rm, unlink } from 'fs/promises';
 import path from 'path';
 import pLimit from 'p-limit';
 
-import { createScript, style } from '../utils/createScript';
-import { fetchWithUA } from '../utils/fetch';
-import { formatMs } from '../utils/time';
+import { createScript, style } from './utils/createScript';
+import { fetchWithUA } from './utils/fetch';
+import { formatMs } from './utils/time';
 
 import { argv } from './cli';
 import { FETCH_CONCURRENCY, GCS_BASE_URL, GCS_BUCKET } from './constants';

@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import path from 'path';
 import pLimit from 'p-limit';
 import { generateText } from 'ai';
-import { withRetry } from '../../utils/retry';
+import { withRetry } from '../utils/retry';
 import { geminiFlashModel } from '../clients';
 import { GEMINI_CONCURRENCY, PROMPTS_DIR } from '../constants';
 import type { ExtractedContent } from '../types';

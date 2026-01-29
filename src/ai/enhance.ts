@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import path from 'path';
 import pLimit from 'p-limit';
 import { generateText } from 'ai';
-import { withRetry } from '../../utils/retry';
+import { withRetry } from '../utils/retry';
 import { claudeSonnetModel } from '../clients';
 import { argv } from '../cli';
 import { GEMINI_CONCURRENCY, PROMPTS_DIR } from '../constants';

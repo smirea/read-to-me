@@ -1,5 +1,5 @@
 import path from 'path';
-import { env, GCS_BASE_URL as _GCS_BASE_URL } from '../config';
+import { env, GCS_BASE_URL as _GCS_BASE_URL } from './config';
 
 // Concurrency limits
 export const GEMINI_CONCURRENCY = 5;

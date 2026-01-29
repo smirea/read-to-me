@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import path from 'path';
 import { generateText } from 'ai';
-import { withRetry } from '../../utils/retry';
+import { withRetry } from '../utils/retry';
 import { geminiFlashModel } from '../clients';
 import { PROMPTS_DIR } from '../constants';
 import type { ExtractedContent } from '../types';

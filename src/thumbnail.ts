@@ -4,9 +4,9 @@ import path from 'path';
 import pLimit from 'p-limit';
 import sharp from 'sharp';
 import { generateText } from 'ai';
-import { escapeXml } from '../utils/xml';
-import { fetchWithUA } from '../utils/fetch';
-import { withRetry } from '../utils/retry';
+import { escapeXml } from './utils/xml';
+import { fetchWithUA } from './utils/fetch';
+import { withRetry } from './utils/retry';
 import { geminiFlashModel, geminiImageGenClient } from './clients';
 import { argv } from './cli';
 import {

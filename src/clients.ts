@@ -3,7 +3,7 @@ import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import { GoogleGenAI } from '@google/genai';
 import { anthropic } from '@ai-sdk/anthropic';
 import { google } from '@ai-sdk/google';
-import { env } from '../config';
+import { env } from './config';
 
 /** Claude Sonnet 4.5 model for TTS enhancement */
 export const claudeSonnetModel = anthropic('claude-sonnet-4-5');
