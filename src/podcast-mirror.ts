@@ -681,6 +681,10 @@ void createScript(async () => {
         console.log();
     }
 
+    if (limit) {
+        channel.item = itemsToProcess;
+    }
+
     const builder = new XMLBuilder({
         ignoreAttributes: false,
         attributeNamePrefix: '@_',
