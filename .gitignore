@@ -7,7 +7,7 @@ output
 *.tgz
 
 # dotenv environment variable files
-.env
+.env.local
 gcp-key.json
 .env.development.local
 .env.test.local
