@@ -1,0 +1,702 @@
+#!/usr/bin/env bun
+import chalk from 'chalk';
+import path from 'path';
+import { createHash } from 'crypto';
+import { mkdir, stat, unlink, writeFile, copyFile } from 'fs/promises';
+import { XMLParser, XMLBuilder } from 'fast-xml-parser';
+import yargs from 'yargs';
+import { hideBin } from 'yargs/helpers';
+import pLimit from 'p-limit';
+import { SpeechClient } from '@google-cloud/speech';
+
+import { createScript, style } from './utils/createScript';
+import { fetchWithUA } from './utils/fetch';
+import { formatMs, parseTimeToMs } from './utils/time';
+import { FETCH_CONCURRENCY, GCS_BASE_URL, GCS_BUCKET, TTS_SAMPLE_RATE } from './constants';
+import { uploadToGCS } from './upload';
+import { generateJsonChapters } from './output';
+import { classifyAdSegments } from './ai/ad-detection';
+import { resolveVoice, DEFAULT_VOICE, VOICE_NAMES, ENGLISH_DIALECTS, type EnglishDialect } from './voice';
+import { gcsClient, ttsClient } from './clients';
+import type { TranscriptSegment, TranscriptWord } from './types';
+
+const argv = yargs(hideBin(process.argv))
+    .scriptName('podcast-mirror')
+    .usage('$0 <feedUrl>', 'Mirror a podcast feed with ad reads spliced to the end', yargs => {
+        return yargs.positional('feedUrl', {
+            describe: 'URL of the podcast RSS feed',
+            type: 'string',
+            demandOption: true,
+        });
+    })
+    .option('output', {
+        alias: 'o',
+        describe: 'Output directory path',
+        type: 'string',
+    })
+    .option('skip-upload', {
+        describe: 'Skip uploading to GCS bucket (for testing)',
+        type: 'boolean',
+        default: false,
+    })
+    .option('limit', {
+        describe: 'Only process the newest N episodes',
+        type: 'number',
+    })
+    .option('voice', {
+        alias: 'v',
+        describe: 'Voice to use for injected ad announcement',
+        choices: [...VOICE_NAMES, 'random', 'random-male', 'random-female'] as const,
+        default: DEFAULT_VOICE,
+    })
+    .option('dialect', {
+        alias: 'd',
+        describe: 'English dialect to use for injected ad announcement',
+        choices: ENGLISH_DIALECTS,
+        default: 'en-US' satisfies EnglishDialect,
+    })
+    .option('language', {
+        describe: 'Language code for transcription',
+        type: 'string',
+        default: 'en-US',
+    })
+    .strict()
+    .help()
+    .parseSync();
+
+const fetchLimit = pLimit(FETCH_CONCURRENCY);
+
+const SEGMENT_TARGET_SEC = 30;
+const SEGMENT_MAX_SEC = 45;
+const SEGMENT_MIN_SEC = 10;
+const AD_PADDING_SEC = 0.4;
+
+function slugify(value: string, maxLen = 60): string {
+    return value
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, maxLen)
+        .replace(/-+$/g, '');
+}
+
+function ensureArray<T>(value: T | T[] | undefined | null): T[] {
+    if (!value) return [];
+    return Array.isArray(value) ? value : [value];
+}
+
+function getText(value: any): string {
+    if (value == null) return '';
+    if (typeof value === 'string' || typeof value === 'number') return String(value);
+    if (typeof value === 'object' && '#text' in value) return String(value['#text'] ?? '');
+    return '';
+}
+
+function setText(node: any, text: string): any {
+    if (node && typeof node === 'object' && '#text' in node) {
+        return { ...node, '#text': text };
+    }
+    return text;
+}
+
+function parseChapterStart(start: string): number {
+    return parseTimeToMs(start) / 1000;
+}
+
+function hashString(value: string): string {
+    return createHash('sha1').update(value).digest('hex').slice(0, 8);
+}
+
+function guessAudioFormat(enclosureUrl: string, enclosureType?: string): { ext: string; mime: string; codec: string } {
+    const lowerType = enclosureType?.toLowerCase() ?? '';
+    let ext = '';
+    try {
+        const url = new URL(enclosureUrl);
+        ext = path.extname(url.pathname).replace('.', '').toLowerCase();
+    } catch {
+        ext = path.extname(enclosureUrl).replace('.', '').toLowerCase();
+    }
+
+    if (lowerType.includes('mpeg') || ext === 'mp3') {
+        return { ext: 'mp3', mime: 'audio/mpeg', codec: 'libmp3lame' };
+    }
+    if (lowerType.includes('mp4') || lowerType.includes('aac') || ext === 'm4a' || ext === 'mp4') {
+        return { ext: 'm4a', mime: 'audio/mp4', codec: 'aac' };
+    }
+
+    return { ext: 'm4a', mime: 'audio/mp4', codec: 'aac' };
+}
+
+async function fetchText(url: string): Promise<string> {
+    const response = await fetchWithUA(url);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch ${url}: ${response.status}`);
+    }
+    return response.text();
+}
+
+async function downloadFile(url: string, destPath: string): Promise<void> {
+    await mkdir(path.dirname(destPath), { recursive: true });
+    const response = await fetchWithUA(url);
+    if (!response.ok) {
+        throw new Error(`Failed to download ${url}: ${response.status}`);
+    }
+    if (response.body) {
+        await Bun.write(destPath, response.body);
+        return;
+    }
+    const data = await response.arrayBuffer();
+    await Bun.write(destPath, Buffer.from(data));
+}
+
+async function getAudioInfo(filePath: string): Promise<{ durationSec: number; sampleRate: number; channels: number; bitRate?: number }> {
+    const result = await Bun.$`ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate,channels,bit_rate -show_entries format=duration -of json ${filePath}`.quiet();
+    if (result.exitCode !== 0) {
+        throw new Error(`ffprobe failed for ${filePath}`);
+    }
+    const data = JSON.parse(result.stdout.toString()) as {
+        streams?: Array<{ sample_rate?: string; channels?: number; bit_rate?: string }>;
+        format?: { duration?: string };
+    };
+    const stream = data.streams?.[0] ?? {};
+    return {
+        durationSec: Number(data.format?.duration ?? 0),
+        sampleRate: Number(stream.sample_rate ?? 44100),
+        channels: Number(stream.channels ?? 2),
+        bitRate: stream.bit_rate ? Number(stream.bit_rate) : undefined,
+    };
+}
+
+async function transcribeAudioWithTimestamps(
+    speechClient: SpeechClient,
+    audioPath: string,
+    gcsObjectPath: string,
+    languageCode: string,
+): Promise<TranscriptWord[]> {
+    const flacPath = audioPath.replace(/\.[^/.]+$/, '.transcribe.flac');
+    const ffmpegResult = await Bun.$`ffmpeg -y -i ${audioPath} -ac 1 -ar 16000 -c:a flac ${flacPath}`.quiet();
+    if (ffmpegResult.exitCode !== 0) {
+        throw new Error('Failed to create transcription FLAC');
+    }
+
+    await uploadToGCS(flacPath, `${GCS_BUCKET}/${gcsObjectPath}`, 'audio/flac');
+    const gcsUri = `gs://${GCS_BUCKET}/${gcsObjectPath}`;
+
+    const [operation] = await speechClient.longRunningRecognize({
+        audio: { uri: gcsUri },
+        config: {
+            encoding: 'FLAC',
+            sampleRateHertz: 16000,
+            languageCode,
+            enableWordTimeOffsets: true,
+            enableAutomaticPunctuation: true,
+        },
+    });
+
+    const [response] = await operation.promise();
+
+    const words: TranscriptWord[] = [];
+    for (const result of response.results ?? []) {
+        const alt = result.alternatives?.[0];
+        for (const wordInfo of alt?.words ?? []) {
+            const startSec = Number(wordInfo.startTime?.seconds ?? 0) + Number(wordInfo.startTime?.nanos ?? 0) / 1e9;
+            const endSec = Number(wordInfo.endTime?.seconds ?? 0) + Number(wordInfo.endTime?.nanos ?? 0) / 1e9;
+            if (!wordInfo.word) continue;
+            words.push({ word: wordInfo.word, startSec, endSec });
+        }
+    }
+
+    await gcsClient.bucket(GCS_BUCKET).file(gcsObjectPath).delete().catch(() => {});
+    await unlink(flacPath).catch(() => {});
+
+    return words;
+}
+
+async function ensureGoogleCredentials(): Promise<string> {
+    const defaultPath = path.join(process.cwd(), 'gcp-key.json');
+    const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS ?? defaultPath;
+    const file = Bun.file(credentialsPath);
+    if (!await file.exists()) {
+        throw new Error('Missing GOOGLE_APPLICATION_CREDENTIALS or gcp-key.json');
+    }
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        process.env.GOOGLE_APPLICATION_CREDENTIALS = credentialsPath;
+    }
+    return credentialsPath;
+}
+
+function buildTranscriptSegments(words: TranscriptWord[]): TranscriptSegment[] {
+    const segments: TranscriptSegment[] = [];
+    let currentWords: string[] = [];
+    let startSec = 0;
+    let endSec = 0;
+
+    const pushSegment = () => {
+        if (currentWords.length === 0) return;
+        const text = currentWords.join(' ').replace(/\s+([.,!?;:])/g, '$1').trim();
+        if (!text) return;
+        segments.push({ index: segments.length + 1, startSec, endSec, text });
+        currentWords = [];
+    };
+
+    for (const word of words) {
+        if (currentWords.length === 0) {
+            startSec = word.startSec;
+        }
+        currentWords.push(word.word);
+        endSec = word.endSec;
+
+        const duration = endSec - startSec;
+        const endsSentence = /[.!?]$/.test(word.word);
+
+        if ((duration >= SEGMENT_TARGET_SEC && endsSentence) || duration >= SEGMENT_MAX_SEC) {
+            pushSegment();
+        }
+    }
+
+    if (currentWords.length > 0) {
+        pushSegment();
+    }
+
+    const merged: TranscriptSegment[] = [];
+    for (const segment of segments) {
+        if (merged.length === 0) {
+            merged.push({ ...segment, index: merged.length + 1 });
+            continue;
+        }
+        const prev = merged[merged.length - 1];
+        const prevDuration = prev.endSec - prev.startSec;
+        if (prevDuration < SEGMENT_MIN_SEC) {
+            prev.endSec = segment.endSec;
+            prev.text = `${prev.text} ${segment.text}`.trim();
+            continue;
+        }
+        merged.push({ ...segment, index: merged.length + 1 });
+    }
+
+    return merged.map((segment, index) => ({ ...segment, index: index + 1 }));
+}
+
+function mergeAdRanges(ranges: Array<{ startSec: number; endSec: number }>): Array<{ startSec: number; endSec: number }> {
+    if (ranges.length === 0) return [];
+    const sorted = ranges
+        .map(r => ({ startSec: Math.max(0, r.startSec), endSec: Math.max(0, r.endSec) }))
+        .sort((a, b) => a.startSec - b.startSec);
+
+    const merged: Array<{ startSec: number; endSec: number }> = [sorted[0]];
+    for (const range of sorted.slice(1)) {
+        const last = merged[merged.length - 1];
+        if (range.startSec <= last.endSec + 0.2) {
+            last.endSec = Math.max(last.endSec, range.endSec);
+        } else {
+            merged.push(range);
+        }
+    }
+    return merged;
+}
+
+function invertRanges(
+    totalDurationSec: number,
+    adRanges: Array<{ startSec: number; endSec: number }>
+): Array<{ startSec: number; endSec: number }> {
+    const keep: Array<{ startSec: number; endSec: number }> = [];
+    let cursor = 0;
+
+    for (const range of adRanges) {
+        if (range.startSec > cursor) {
+            keep.push({ startSec: cursor, endSec: range.startSec });
+        }
+        cursor = Math.max(cursor, range.endSec);
+    }
+
+    if (cursor < totalDurationSec) {
+        keep.push({ startSec: cursor, endSec: totalDurationSec });
+    }
+
+    return keep.filter(r => r.endSec - r.startSec > 0.1);
+}
+
+function adjustChapterStart(originalSec: number, adRanges: Array<{ startSec: number; endSec: number }>): number {
+    let shift = 0;
+    for (const range of adRanges) {
+        if (range.endSec <= originalSec) {
+            shift += range.endSec - range.startSec;
+        } else if (range.startSec < originalSec) {
+            shift += originalSec - range.startSec;
+            break;
+        } else {
+            break;
+        }
+    }
+    return Math.max(0, originalSec - shift);
+}
+
+async function extractSegment(
+    inputPath: string,
+    segment: { startSec: number; endSec: number },
+    outputPath: string,
+    sampleRate: number,
+    channels: number,
+): Promise<void> {
+    const duration = Math.max(0, segment.endSec - segment.startSec);
+    if (duration <= 0.1) return;
+    const result = await Bun.$`ffmpeg -y -i ${inputPath} -ss ${segment.startSec} -t ${duration} -ar ${sampleRate} -ac ${channels} -c:a pcm_s16le ${outputPath}`.quiet();
+    if (result.exitCode !== 0) {
+        throw new Error(`Failed to extract segment ${segment.startSec}-${segment.endSec}`);
+    }
+}
+
+async function synthesizeAnnouncement(
+    text: string,
+    outputPath: string,
+    sampleRate: number,
+    channels: number,
+    voice: string,
+    dialect: EnglishDialect,
+): Promise<void> {
+    const [response] = await ttsClient.synthesizeSpeech({
+        input: { text },
+        voice: {
+            languageCode: dialect,
+            name: `${dialect}-Chirp3-HD-${voice}`,
+        },
+        audioConfig: {
+            audioEncoding: 'LINEAR16',
+            sampleRateHertz: TTS_SAMPLE_RATE,
+            speakingRate: 0.9,
+        },
+    });
+
+    if (!response.audioContent) {
+        throw new Error('TTS did not return audio content');
+    }
+
+    const pcmPath = outputPath.replace(/\.wav$/, '.pcm');
+    await Bun.write(pcmPath, Buffer.from(response.audioContent as Uint8Array));
+
+    const result = await Bun.$`ffmpeg -y -f s16le -ar ${TTS_SAMPLE_RATE} -ac 1 -i ${pcmPath} -ar ${sampleRate} -ac ${channels} -c:a pcm_s16le ${outputPath}`.quiet();
+    if (result.exitCode !== 0) {
+        throw new Error('Failed to convert announcement audio');
+    }
+
+    await unlink(pcmPath).catch(() => {});
+}
+
+async function concatSegments(
+    segmentPaths: string[],
+    outputPath: string,
+    codec: string,
+    sampleRate: number,
+    channels: number,
+    bitRateKbps: number,
+): Promise<void> {
+    const listPath = outputPath.replace(/\.[^/.]+$/, '.concat.txt');
+    const listContent = segmentPaths.map(segment => `file '${segment.replace(/'/g, "'\\''")}'`).join('\n');
+    await writeFile(listPath, listContent, 'utf-8');
+
+    let result;
+    if (codec === 'aac') {
+        result = await Bun.$`ffmpeg -y -f concat -safe 0 -i ${listPath} -ar ${sampleRate} -ac ${channels} -b:a ${bitRateKbps}k -c:a ${codec} -movflags +faststart ${outputPath}`.quiet();
+    } else {
+        result = await Bun.$`ffmpeg -y -f concat -safe 0 -i ${listPath} -ar ${sampleRate} -ac ${channels} -b:a ${bitRateKbps}k -c:a ${codec} ${outputPath}`.quiet();
+    }
+    if (result.exitCode !== 0) {
+        throw new Error('Failed to concatenate segments');
+    }
+}
+
+function buildChapters(
+    originalChapters: Array<{ title: string; startSec: number }>,
+    adRanges: Array<{ startSec: number; endSec: number }>,
+    mainDurationSec: number,
+    includeAds: boolean,
+    adCount: number,
+): Array<{ title: string; startMs: number }> {
+    const adjusted = originalChapters
+        .map(chapter => ({
+            title: chapter.title || 'Chapter',
+            startSec: adjustChapterStart(chapter.startSec, adRanges),
+        }))
+        .filter(chapter => chapter.startSec < mainDurationSec)
+        .sort((a, b) => a.startSec - b.startSec);
+
+    const deduped: Array<{ title: string; startSec: number }> = [];
+    for (const chapter of adjusted) {
+        const last = deduped[deduped.length - 1];
+        if (!last || Math.abs(last.startSec - chapter.startSec) > 0.5) {
+            deduped.push(chapter);
+        }
+    }
+
+    if (deduped.length === 0) {
+        deduped.push({ title: 'Episode', startSec: 0 });
+    }
+
+    if (includeAds) {
+        const title = adCount === 1 ? 'Spliced Ad Read' : `Spliced Ad Reads (${adCount})`;
+        deduped.push({ title, startSec: mainDurationSec });
+    }
+
+    return deduped.map(chapter => ({ title: chapter.title, startMs: Math.round(chapter.startSec * 1000) }));
+}
+
+function updateGuid(node: any, value: string): any {
+    if (node && typeof node === 'object') {
+        return { ...node, '#text': value };
+    }
+    return value;
+}
+
+function updateAtomSelfLink(channel: any, feedUrl: string) {
+    const atomLinks = ensureArray(channel['atom:link']);
+    let updated = false;
+    const updatedLinks = atomLinks.map(link => {
+        if (link?.['@_rel'] === 'self') {
+            updated = true;
+            return { ...link, '@_href': feedUrl };
+        }
+        return link;
+    });
+    if (updated) {
+        channel['atom:link'] = updatedLinks;
+    }
+}
+
+void createScript(async () => {
+    const feedUrl = argv.feedUrl as string;
+    const outputDir = argv.output ? path.resolve(argv.output) : null;
+    const skipUpload = argv['skip-upload'];
+    const limit = typeof argv.limit === 'number' && argv.limit > 0 ? argv.limit : null;
+    const voice = resolveVoice(argv.voice);
+    const dialect = argv.dialect as EnglishDialect;
+    const languageCode = argv.language as string;
+
+    await ensureGoogleCredentials();
+    const speechClient = new SpeechClient();
+
+    console.log(style.header('Podcast Mirror'));
+    console.log('Configuration:');
+    console.log(`  Feed URL: ${feedUrl}`);
+    console.log(`  Voice: ${dialect}-Chirp3-HD-${voice}`);
+    console.log(`  Transcription language: ${languageCode}`);
+    console.log(`  Output: ${outputDir || '(auto)'}`);
+    console.log(`  Upload: ${skipUpload ? 'disabled' : 'enabled'}`);
+    if (limit) console.log(`  Episode limit: ${limit}`);
+    console.log();
+
+    const projectId = await speechClient.getProjectId();
+    console.log(`  GCP Project: ${projectId}`);
+    console.log();
+
+    const feedXml = await fetchText(feedUrl);
+    const parser = new XMLParser({
+        ignoreAttributes: false,
+        attributeNamePrefix: '@_',
+        removeNSPrefix: false,
+        isArray: (name) => name === 'item' || name === 'psc:chapter' || name === 'atom:link',
+    });
+    const parsed = parser.parse(feedXml) as any;
+    const channel = parsed?.rss?.channel;
+    if (!channel) {
+        throw new Error('Invalid RSS feed: missing channel');
+    }
+
+    parsed.rss['@_xmlns:psc'] ??= 'http://podlove.org/simple-chapters';
+    parsed.rss['@_xmlns:podcast'] ??= 'https://podcastindex.org/namespace/1.0';
+
+    const originalTitle = getText(channel.title) || 'Podcast';
+    const mirrorTitle = `R2M: ${originalTitle}`;
+    const mirrorSlug = slugify(mirrorTitle, 80) || 'r2m-podcast';
+    const gcsRoot = mirrorSlug;
+    const gcsFeedUrl = `${GCS_BASE_URL}/${gcsRoot}/feed.xml`;
+
+    channel.title = setText(channel.title, mirrorTitle);
+    if (channel['itunes:title']) {
+        channel['itunes:title'] = setText(channel['itunes:title'], mirrorTitle);
+    }
+    updateAtomSelfLink(channel, gcsFeedUrl);
+
+    const items = ensureArray(channel.item);
+    if (items.length === 0) {
+        throw new Error('No episodes found in feed');
+    }
+
+    const itemsToProcess = limit ? items.slice(0, limit) : items;
+    console.log(style.header('Episodes'));
+    console.log(`  Total in feed: ${items.length}`);
+    console.log(`  Processing: ${itemsToProcess.length}`);
+    console.log();
+
+    const baseOutputDir = outputDir || path.join(process.cwd(), 'output', mirrorSlug);
+    await mkdir(baseOutputDir, { recursive: true });
+
+    for (let index = 0; index < itemsToProcess.length; index++) {
+        const item = itemsToProcess[index];
+        const title = getText(item.title) || `Episode ${index + 1}`;
+        const enclosure = item.enclosure || {};
+        const enclosureUrl = enclosure['@_url'] as string;
+        const enclosureType = enclosure['@_type'] as string | undefined;
+
+        if (!enclosureUrl) {
+            console.log(chalk.yellow(`  ⚠ Skipping episode without enclosure: ${title}`));
+            continue;
+        }
+
+        const slugBase = slugify(title);
+        const guidValue = getText(item.guid) || enclosureUrl;
+        const episodeHash = hashString(guidValue);
+        const episodeNumber = String(index + 1).padStart(3, '0');
+        const episodeSlug = `${episodeNumber}_${slugBase}_${episodeHash}`;
+        const episodeDir = path.join(baseOutputDir, episodeSlug);
+        await mkdir(episodeDir, { recursive: true });
+
+        console.log(chalk.blue.bold(`Episode ${episodeNumber}: ${title}`));
+
+        const { ext, mime, codec } = guessAudioFormat(enclosureUrl, enclosureType);
+        const originalPath = path.join(episodeDir, `original.${ext}`);
+        const outputAudioPath = path.join(episodeDir, `${episodeSlug}.${ext}`);
+
+        console.log(chalk.gray('  Downloading audio...'));
+        await fetchLimit(() => downloadFile(enclosureUrl, originalPath));
+
+        const audioInfo = await getAudioInfo(originalPath);
+        console.log(chalk.gray(`  Duration: ${audioInfo.durationSec.toFixed(1)}s`));
+
+        console.log(chalk.gray('  Transcribing audio...'));
+        const transcriptionObjectPath = `${gcsRoot}/transcripts/${episodeSlug}.flac`;
+        const words = await transcribeAudioWithTimestamps(speechClient, originalPath, transcriptionObjectPath, languageCode);
+        console.log(chalk.gray(`  Transcript words: ${words.length}`));
+
+        const segments = buildTranscriptSegments(words);
+        console.log(chalk.gray(`  Transcript segments: ${segments.length}`));
+
+        console.log(chalk.gray('  Detecting ad reads...'));
+        const labels = await classifyAdSegments(segments);
+        const labelMap = new Map(labels.map(label => [label.index, label.label]));
+        const adSegments = segments
+            .filter(segment => labelMap.get(segment.index) === 'ad')
+            .map(segment => ({
+                startSec: Math.max(0, segment.startSec - AD_PADDING_SEC),
+                endSec: Math.min(audioInfo.durationSec, segment.endSec + AD_PADDING_SEC),
+            }));
+
+        const mergedAdRanges = mergeAdRanges(adSegments);
+        const adDuration = mergedAdRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
+
+        if (mergedAdRanges.length === 0) {
+            console.log(chalk.yellow('  No ad segments detected; mirroring original audio'));
+            await copyFile(originalPath, outputAudioPath);
+        } else {
+            console.log(chalk.green(`  Detected ${mergedAdRanges.length} ad ranges (${adDuration.toFixed(1)}s)`));
+            const keepRanges = invertRanges(audioInfo.durationSec, mergedAdRanges);
+            const segmentDir = path.join(episodeDir, 'segments');
+            await mkdir(segmentDir, { recursive: true });
+
+            const keepFiles: string[] = [];
+            for (let i = 0; i < keepRanges.length; i++) {
+                const segmentPath = path.join(segmentDir, `keep-${String(i + 1).padStart(3, '0')}.wav`);
+                await extractSegment(originalPath, keepRanges[i], segmentPath, audioInfo.sampleRate, audioInfo.channels);
+                keepFiles.push(segmentPath);
+            }
+
+            const adFiles: string[] = [];
+            for (let i = 0; i < mergedAdRanges.length; i++) {
+                const segmentPath = path.join(segmentDir, `ad-${String(i + 1).padStart(3, '0')}.wav`);
+                await extractSegment(originalPath, mergedAdRanges[i], segmentPath, audioInfo.sampleRate, audioInfo.channels);
+                adFiles.push(segmentPath);
+            }
+
+            const announcementPath = path.join(segmentDir, 'announcement.wav');
+            const announcementText = `starting ${mergedAdRanges.length} spliced ad ${mergedAdRanges.length === 1 ? 'read' : 'reads'}`;
+            await synthesizeAnnouncement(announcementText, announcementPath, audioInfo.sampleRate, audioInfo.channels, voice, dialect);
+
+            const bitRateKbps = Math.max(64, Math.round((audioInfo.bitRate ?? 128000) / 1000));
+            const concatOrder = [...keepFiles, announcementPath, ...adFiles];
+            await concatSegments(concatOrder, outputAudioPath, codec, audioInfo.sampleRate, audioInfo.channels, bitRateKbps);
+        }
+
+        const outputInfo = await getAudioInfo(outputAudioPath);
+        const outputStats = await stat(outputAudioPath);
+
+        const originalChapters = ensureArray(item['psc:chapters']?.['psc:chapter']).map((chapter: any) => ({
+            title: chapter['@_title'] || 'Chapter',
+            startSec: parseChapterStart(chapter['@_start'] || '0:00:00'),
+        }));
+
+        const mainDurationSec = mergedAdRanges.length > 0
+            ? Math.max(0, audioInfo.durationSec - adDuration)
+            : outputInfo.durationSec;
+
+        const chapters = buildChapters(
+            originalChapters,
+            mergedAdRanges,
+            mainDurationSec,
+            mergedAdRanges.length > 0,
+            mergedAdRanges.length,
+        );
+
+        const chaptersJson = generateJsonChapters(
+            chapters.map(ch => ({ title: ch.title, startMs: ch.startMs })),
+            getText(item.link)
+        );
+
+        const chaptersJsonPath = path.join(episodeDir, `${episodeSlug}-chapters.json`);
+        await writeFile(chaptersJsonPath, JSON.stringify(chaptersJson, null, 2), 'utf-8');
+
+        const gcsEpisodePath = `${gcsRoot}/${episodeSlug}`;
+        const audioUrl = `${GCS_BASE_URL}/${gcsEpisodePath}/${episodeSlug}.${ext}`;
+        const chaptersJsonUrl = `${GCS_BASE_URL}/${gcsEpisodePath}/${episodeSlug}-chapters.json`;
+
+        item.enclosure = {
+            ...item.enclosure,
+            '@_url': audioUrl,
+            '@_length': String(outputStats.size),
+            '@_type': mime,
+        };
+
+        item.guid = updateGuid(item.guid, audioUrl);
+        item['itunes:duration'] = setText(item['itunes:duration'], formatMs(Math.round(outputInfo.durationSec * 1000)));
+
+        item['psc:chapters'] = {
+            '@_version': '1.2',
+            'psc:chapter': chapters.map(chapter => ({
+                '@_start': formatMs(chapter.startMs),
+                '@_title': chapter.title,
+            })),
+        };
+
+        item['podcast:chapters'] = {
+            '@_url': chaptersJsonUrl,
+            '@_type': 'application/json+chapters',
+        };
+
+        if (!skipUpload) {
+            console.log(chalk.gray('  Uploading processed audio...'));
+            await uploadToGCS(outputAudioPath, `${GCS_BUCKET}/${gcsEpisodePath}/${episodeSlug}.${ext}`, mime);
+            console.log(chalk.gray('  Uploading chapters JSON...'));
+            await uploadToGCS(chaptersJsonPath, `${GCS_BUCKET}/${gcsEpisodePath}/${episodeSlug}-chapters.json`, 'application/json');
+        }
+
+        console.log(chalk.green(`  ✓ ${episodeSlug}.${ext} (${(outputStats.size / 1024 / 1024).toFixed(1)} MB)`));
+        console.log();
+    }
+
+    const builder = new XMLBuilder({
+        ignoreAttributes: false,
+        attributeNamePrefix: '@_',
+        suppressEmptyNode: true,
+    });
+    const updatedXml = builder.build(parsed);
+
+    const feedOutputPath = path.join(baseOutputDir, 'feed.xml');
+    await writeFile(feedOutputPath, updatedXml, 'utf-8');
+
+    if (!skipUpload) {
+        await uploadToGCS(feedOutputPath, `${GCS_BUCKET}/${gcsRoot}/feed.xml`, 'application/rss+xml');
+    }
+
+    console.log(style.header('Mirror Complete'));
+    console.log(`  Feed title: ${mirrorTitle}`);
+    console.log(`  Feed URL: ${gcsFeedUrl}`);
+    console.log(`  Output: ${baseOutputDir}`);
+});

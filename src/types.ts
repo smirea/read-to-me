@@ -94,6 +94,25 @@ export interface ChapterImageData {
     description: string;
 }
 
+export interface TranscriptWord {
+    word: string;
+    startSec: number;
+    endSec: number;
+}
+
+export interface TranscriptSegment {
+    index: number;
+    startSec: number;
+    endSec: number;
+    text: string;
+}
+
+export interface AdSegmentLabel {
+    index: number;
+    label: 'ad' | 'content';
+    reason?: string;
+}
+
 export interface RssFeedOptions {
     title: string;
     author: string;

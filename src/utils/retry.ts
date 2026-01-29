@@ -13,7 +13,11 @@ export async function withRetry<T>(
     return pRetry(fn, {
         retries,
         onFailedAttempt: (error) => {
-            const errMessage = error.message || String(error) || 'Unknown error';
+            const errMessage = error instanceof Error
+                ? error.message
+                : typeof error === 'string'
+                    ? error
+                    : 'Unknown error';
             console.log(chalk.yellow(`  ${label} failed (attempt ${error.attemptNumber}/${retries + 1}): ${errMessage}`));
         },
     });

@@ -12,6 +12,7 @@
         "@ai-sdk/anthropic": "^3.0.23",
         "@ai-sdk/google": "^3.0.13",
         "@google-cloud/storage": "^7.18.0",
+        "@google-cloud/speech": "^7.2.1",
         "@google-cloud/text-to-speech": "^6.4.0",
         "@google/genai": "^1.38.0",
         "@google/generative-ai": "^0.24.1",
