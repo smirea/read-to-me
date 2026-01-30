@@ -39,9 +39,22 @@ const argv = yargs(hideBin(process.argv))
         type: 'boolean',
         default: false,
     })
+    .option('first', {
+        describe: 'Only process the first N episodes in the feed order',
+        type: 'number',
+    })
+    .option('last', {
+        describe: 'Only process the last N episodes in the feed order',
+        type: 'number',
+    })
     .option('limit', {
         describe: 'Only process the newest N episodes',
         type: 'number',
+    })
+    .option('episode', {
+        describe: 'Episode title fuzzy search (can be repeated)',
+        type: 'string',
+        array: true,
     })
     .option('voice', {
         alias: 'v',
@@ -107,6 +120,27 @@ function hashString(value: string): string {
     return createHash('sha1').update(value).digest('hex').slice(0, 8);
 }
 
+function normalizeTitle(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function matchesEpisodeQuery(title: string, query: string): boolean {
+    const normalizedTitle = normalizeTitle(title);
+    const normalizedQuery = normalizeTitle(query);
+    if (!normalizedQuery) return false;
+    if (normalizedTitle.includes(normalizedQuery)) return true;
+    const tokens = normalizedQuery.split(' ').filter(Boolean);
+    return tokens.every(token => normalizedTitle.includes(token));
+}
+
+function extractEpisodeSlug(enclosureUrl: string, gcsRoot: string): string | null {
+    if (!enclosureUrl) return null;
+    const escapedRoot = gcsRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = enclosureUrl.match(new RegExp(`/${escapedRoot}/([^/]+)/`));
+    if (!match) return null;
+    return match[1];
+}
+
 function guessAudioFormat(enclosureUrl: string, enclosureType?: string): { ext: string; mime: string; codec: string } {
     const lowerType = enclosureType?.toLowerCase() ?? '';
     let ext = '';
@@ -133,6 +167,30 @@ async function fetchText(url: string): Promise<string> {
         throw new Error(`Failed to fetch ${url}: ${response.status}`);
     }
     return response.text();
+}
+
+async function fetchExistingEpisodeSlugs(feedUrl: string, gcsRoot: string): Promise<Set<string>> {
+    try {
+        const feedXml = await fetchText(feedUrl);
+        const parser = new XMLParser({
+            ignoreAttributes: false,
+            attributeNamePrefix: '@_',
+            removeNSPrefix: false,
+            isArray: (name) => name === 'item',
+        });
+        const parsed = parser.parse(feedXml) as any;
+        const items = ensureArray(parsed?.rss?.channel?.item);
+        const slugs = new Set<string>();
+        for (const item of items) {
+            const enclosureUrl = item?.enclosure?.['@_url'];
+            if (typeof enclosureUrl !== 'string') continue;
+            const slug = extractEpisodeSlug(enclosureUrl, gcsRoot);
+            if (slug) slugs.add(slug);
+        }
+        return slugs;
+    } catch {
+        return new Set();
+    }
 }
 
 async function downloadFile(url: string, destPath: string): Promise<void> {
@@ -467,9 +525,19 @@ void createScript(async () => {
     const outputDir = argv.output ? path.resolve(argv.output) : null;
     const skipUpload = argv['skip-upload'];
     const limit = typeof argv.limit === 'number' && argv.limit > 0 ? argv.limit : null;
+    const first = typeof argv.first === 'number' && argv.first > 0 ? argv.first : null;
+    const last = typeof argv.last === 'number' && argv.last > 0 ? argv.last : null;
+    const episodeQueries = (argv.episode as string[] | undefined)?.filter(Boolean) ?? [];
     const voice = resolveVoice(argv.voice);
     const dialect = argv.dialect as EnglishDialect;
     const languageCode = argv.language as string;
+
+    if (first && last) {
+        throw new Error('Use only one of --first or --last');
+    }
+    if (limit && (first || last)) {
+        throw new Error('Use --limit or --first/--last, not both');
+    }
 
     await ensureGoogleCredentials();
     const speechClient = new SpeechClient();
@@ -482,6 +550,9 @@ void createScript(async () => {
     console.log(`  Output: ${outputDir || '(auto)'}`);
     console.log(`  Upload: ${skipUpload ? 'disabled' : 'enabled'}`);
     if (limit) console.log(`  Episode limit: ${limit}`);
+    if (first) console.log(`  First episodes: ${first}`);
+    if (last) console.log(`  Last episodes: ${last}`);
+    if (episodeQueries.length > 0) console.log(`  Episode queries: ${episodeQueries.join(', ')}`);
     console.log();
 
     const projectId = await speechClient.getProjectId();
@@ -521,18 +592,40 @@ void createScript(async () => {
         throw new Error('No episodes found in feed');
     }
 
-    const itemsToProcess = limit ? items.slice(0, limit) : items;
+    const itemsWithIndex = items.map((item, index) => ({ item, index }));
+    let itemsToProcess = itemsWithIndex;
+
+    if (episodeQueries.length > 0) {
+        itemsToProcess = itemsToProcess.filter(({ item }) => {
+            const title = getText(item.title);
+            return episodeQueries.some(query => matchesEpisodeQuery(title, query));
+        });
+        if (itemsToProcess.length === 0) {
+            throw new Error('No episodes matched the provided --episode filters');
+        }
+    }
+
+    const takeFirst = limit ?? first;
+    if (takeFirst) {
+        itemsToProcess = itemsToProcess.slice(0, takeFirst);
+    } else if (last) {
+        itemsToProcess = itemsToProcess.slice(-last);
+    }
+
+    const itemsToProcessCount = itemsToProcess.length;
+    const selectedItems = itemsToProcess.map(({ item }) => item);
     console.log(style.header('Episodes'));
     console.log(`  Total in feed: ${items.length}`);
-    console.log(`  Processing: ${itemsToProcess.length}`);
+    console.log(`  Processing: ${itemsToProcessCount}`);
     console.log();
 
     const baseOutputDir = outputDir || path.join(process.cwd(), 'output', mirrorSlug);
     await mkdir(baseOutputDir, { recursive: true });
+    const existingSlugs = await fetchExistingEpisodeSlugs(gcsFeedUrl, gcsRoot);
 
     for (let index = 0; index < itemsToProcess.length; index++) {
-        const item = itemsToProcess[index];
-        const title = getText(item.title) || `Episode ${index + 1}`;
+        const { item, index: originalIndex } = itemsToProcess[index];
+        const title = getText(item.title) || `Episode ${originalIndex + 1}`;
         const enclosure = item.enclosure || {};
         const enclosureUrl = enclosure['@_url'] as string;
         const enclosureType = enclosure['@_type'] as string | undefined;
@@ -542,15 +635,28 @@ void createScript(async () => {
             continue;
         }
 
-        const slugBase = slugify(title);
+        const slugBase = slugify(title) || `episode-${originalIndex + 1}`;
         const guidValue = getText(item.guid) || enclosureUrl;
         const episodeHash = hashString(guidValue);
-        const episodeNumber = String(index + 1).padStart(3, '0');
-        const episodeSlug = `${episodeNumber}_${slugBase}_${episodeHash}`;
+        const episodeSlug = `${slugBase}_${episodeHash}`;
         const episodeDir = path.join(baseOutputDir, episodeSlug);
+        const alreadyInFeed = existingSlugs.has(episodeSlug);
+        let localExists = false;
+        try {
+            const existingStat = await stat(episodeDir);
+            localExists = existingStat.isDirectory();
+        } catch {
+            localExists = false;
+        }
+
+        if (alreadyInFeed || localExists) {
+            console.log(chalk.yellow(`  ↷ Skipping already imported: ${title}`));
+            continue;
+        }
+
         await mkdir(episodeDir, { recursive: true });
 
-        console.log(chalk.blue.bold(`Episode ${episodeNumber}: ${title}`));
+        console.log(chalk.blue.bold(`Episode ${originalIndex + 1}: ${title}`));
 
         const { ext, mime, codec } = guessAudioFormat(enclosureUrl, enclosureType);
         const originalPath = path.join(episodeDir, `original.${ext}`);
@@ -681,8 +787,8 @@ void createScript(async () => {
         console.log();
     }
 
-    if (limit) {
-        channel.item = itemsToProcess;
+    if (selectedItems.length !== items.length) {
+        channel.item = selectedItems;
     }
 
     const builder = new XMLBuilder({

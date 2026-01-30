@@ -37,3 +37,4 @@ Create a new script `podcast-mirror.ts` that ingests a podcast feed URL and prod
 ## Progress log
 - 2026-01-29: Initialized project plan and clarified unknowns.
 - 2026-01-29: Added ad detection prompt + AI classifier, created `podcast-mirror.ts`, added Speech-to-Text dependency, and wired transcript/splice/chapter pipeline.
+- 2026-01-30: Added episode selection flags (`--first`, `--last`, `--episode`) and skip logic for already-imported episodes.
