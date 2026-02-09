@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import chalk from 'chalk';
 import path from 'path';
-import { createHash } from 'crypto';
 import { mkdir, stat, unlink, writeFile, copyFile } from 'fs/promises';
 import { XMLParser, XMLBuilder } from 'fast-xml-parser';
 import yargs from 'yargs';
@@ -11,13 +10,14 @@ import { SpeechClient } from '@google-cloud/speech';
 
 import { createScript, style } from './utils/createScript';
 import { fetchWithUA } from './utils/fetch';
-import { formatMs, parseTimeToMs } from './utils/time';
+import { formatMs, formatChapterTime, parseTimeToMs } from './utils/time';
 import { FETCH_CONCURRENCY, GCS_BASE_URL, GCS_BUCKET, TTS_SAMPLE_RATE } from './constants';
 import { uploadToGCS } from './upload';
 import { generateJsonChapters } from './output';
 import { classifyAdSegments } from './ai/ad-detection';
 import { resolveVoice, DEFAULT_VOICE, VOICE_NAMES, ENGLISH_DIALECTS, type EnglishDialect } from './voice';
 import { gcsClient, ttsClient } from './clients';
+import { applyMirroredItemFields, buildMergedMirrorItems, computeEpisodeSlug, extractEpisodeSlug, slugify } from './podcast-mirror/feed-utils';
 import type { TranscriptSegment, TranscriptWord } from './types';
 
 const argv = yargs(hideBin(process.argv))
@@ -84,15 +84,6 @@ const SEGMENT_MAX_SEC = 45;
 const SEGMENT_MIN_SEC = 10;
 const AD_PADDING_SEC = 0.4;
 
-function slugify(value: string, maxLen = 60): string {
-    return value
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .slice(0, maxLen)
-        .replace(/-+$/g, '');
-}
-
 function ensureArray<T>(value: T | T[] | undefined | null): T[] {
     if (!value) return [];
     return Array.isArray(value) ? value : [value];
@@ -116,10 +107,6 @@ function parseChapterStart(start: string): number {
     return parseTimeToMs(start) / 1000;
 }
 
-function hashString(value: string): string {
-    return createHash('sha1').update(value).digest('hex').slice(0, 8);
-}
-
 function normalizeTitle(value: string): string {
     return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
@@ -131,14 +118,6 @@ function matchesEpisodeQuery(title: string, query: string): boolean {
     if (normalizedTitle.includes(normalizedQuery)) return true;
     const tokens = normalizedQuery.split(' ').filter(Boolean);
     return tokens.every(token => normalizedTitle.includes(token));
-}
-
-function extractEpisodeSlug(enclosureUrl: string, gcsRoot: string): string | null {
-    if (!enclosureUrl) return null;
-    const escapedRoot = gcsRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const match = enclosureUrl.match(new RegExp(`/${escapedRoot}/([^/]+)/`));
-    if (!match) return null;
-    return match[1];
 }
 
 function guessAudioFormat(enclosureUrl: string, enclosureType?: string): { ext: string; mime: string; codec: string } {
@@ -169,27 +148,37 @@ async function fetchText(url: string): Promise<string> {
     return response.text();
 }
 
-async function fetchExistingEpisodeSlugs(feedUrl: string, gcsRoot: string): Promise<Set<string>> {
+async function fetchExistingMirrorItems(feedUrl: string, gcsRoot: string): Promise<{
+    itemsBySlug: Map<string, any>;
+    slugsInOrder: string[];
+}> {
     try {
         const feedXml = await fetchText(feedUrl);
         const parser = new XMLParser({
             ignoreAttributes: false,
             attributeNamePrefix: '@_',
             removeNSPrefix: false,
-            isArray: (name) => name === 'item',
+            isArray: (name) => name === 'item' || name === 'psc:chapter' || name === 'atom:link',
         });
         const parsed = parser.parse(feedXml) as any;
-        const items = ensureArray(parsed?.rss?.channel?.item);
-        const slugs = new Set<string>();
+        const channel = parsed?.rss?.channel;
+        const items = ensureArray(channel?.item);
+
+        const itemsBySlug = new Map<string, any>();
+        const slugsInOrder: string[] = [];
+
         for (const item of items) {
             const enclosureUrl = item?.enclosure?.['@_url'];
             if (typeof enclosureUrl !== 'string') continue;
             const slug = extractEpisodeSlug(enclosureUrl, gcsRoot);
-            if (slug) slugs.add(slug);
+            if (!slug) continue;
+            itemsBySlug.set(slug, item);
+            slugsInOrder.push(slug);
         }
-        return slugs;
+
+        return { itemsBySlug, slugsInOrder };
     } catch {
-        return new Set();
+        return { itemsBySlug: new Map(), slugsInOrder: [] };
     }
 }
 
@@ -592,7 +581,18 @@ void createScript(async () => {
         throw new Error('No episodes found in feed');
     }
 
-    const itemsWithIndex = items.map((item, index) => ({ item, index }));
+    const itemSlugs = items.map((item, index) => {
+        const title = getText(item.title) || `Episode ${index + 1}`;
+        const enclosureUrl = item?.enclosure?.['@_url'];
+        const guidValue = getText(item.guid) || (typeof enclosureUrl === 'string' ? enclosureUrl : '');
+        return computeEpisodeSlug(title, guidValue, index + 1);
+    });
+
+    const itemsWithIndex = items.map((item, index) => ({
+        item,
+        index,
+        episodeSlug: itemSlugs[index],
+    }));
     let itemsToProcess = itemsWithIndex;
 
     if (episodeQueries.length > 0) {
@@ -613,7 +613,6 @@ void createScript(async () => {
     }
 
     const itemsToProcessCount = itemsToProcess.length;
-    const selectedItems = itemsToProcess.map(({ item }) => item);
     console.log(style.header('Episodes'));
     console.log(`  Total in feed: ${items.length}`);
     console.log(`  Processing: ${itemsToProcessCount}`);
@@ -621,10 +620,12 @@ void createScript(async () => {
 
     const baseOutputDir = outputDir || path.join(process.cwd(), 'output', mirrorSlug);
     await mkdir(baseOutputDir, { recursive: true });
-    const existingSlugs = await fetchExistingEpisodeSlugs(gcsFeedUrl, gcsRoot);
+    const existingMirror = await fetchExistingMirrorItems(gcsFeedUrl, gcsRoot);
+    const existingSlugs = new Set(existingMirror.itemsBySlug.keys());
+    const processedSlugs = new Set<string>();
 
     for (let index = 0; index < itemsToProcess.length; index++) {
-        const { item, index: originalIndex } = itemsToProcess[index];
+        const { item, index: originalIndex, episodeSlug } = itemsToProcess[index];
         const title = getText(item.title) || `Episode ${originalIndex + 1}`;
         const enclosure = item.enclosure || {};
         const enclosureUrl = enclosure['@_url'] as string;
@@ -635,10 +636,6 @@ void createScript(async () => {
             continue;
         }
 
-        const slugBase = slugify(title) || `episode-${originalIndex + 1}`;
-        const guidValue = getText(item.guid) || enclosureUrl;
-        const episodeHash = hashString(guidValue);
-        const episodeSlug = `${slugBase}_${episodeHash}`;
         const episodeDir = path.join(baseOutputDir, episodeSlug);
         const alreadyInFeed = existingSlugs.has(episodeSlug);
         let localExists = false;
@@ -649,8 +646,19 @@ void createScript(async () => {
             localExists = false;
         }
 
-        if (alreadyInFeed || localExists) {
-            console.log(chalk.yellow(`  ↷ Skipping already imported: ${title}`));
+        if (alreadyInFeed) {
+            const mirroredItem = existingMirror.itemsBySlug.get(episodeSlug);
+            if (mirroredItem) {
+                applyMirroredItemFields(item, mirroredItem);
+                console.log(chalk.yellow(`  ↷ Skipping already imported: ${title}`));
+            } else {
+                console.log(chalk.yellow(`  ↷ Skipping already imported (missing mirrored metadata): ${title}`));
+            }
+            continue;
+        }
+
+        if (localExists) {
+            console.log(chalk.yellow(`  ↷ Skipping existing local output: ${title}`));
             continue;
         }
 
@@ -766,7 +774,7 @@ void createScript(async () => {
         item['psc:chapters'] = {
             '@_version': '1.2',
             'psc:chapter': chapters.map(chapter => ({
-                '@_start': formatMs(chapter.startMs),
+                '@_start': formatChapterTime(chapter.startMs),
                 '@_title': chapter.title,
             })),
         };
@@ -783,13 +791,18 @@ void createScript(async () => {
             await uploadToGCS(chaptersJsonPath, `${GCS_BUCKET}/${gcsEpisodePath}/${episodeSlug}-chapters.json`, 'application/json');
         }
 
+        processedSlugs.add(episodeSlug);
         console.log(chalk.green(`  ✓ ${episodeSlug}.${ext} (${(outputStats.size / 1024 / 1024).toFixed(1)} MB)`));
         console.log();
     }
 
-    if (selectedItems.length !== items.length) {
-        channel.item = selectedItems;
-    }
+    channel.item = buildMergedMirrorItems({
+        sourceItems: items,
+        existingItemsBySlug: existingMirror.itemsBySlug,
+        existingSlugsInOrder: existingMirror.slugsInOrder,
+        processedSlugs,
+        getSlugForSourceItem: (_item, index) => itemSlugs[index],
+    });
 
     const builder = new XMLBuilder({
         ignoreAttributes: false,

@@ -68,3 +68,18 @@ When uploaded (default), also updates the master RSS feed at:
 
 - `bun run start <url>`: run once
 - `bun run dev`: auto-reload while editing `src/read-to-me.ts`
+
+## Podcast Mirror (Ad Splicing)
+
+`src/podcast-mirror.ts` mirrors an existing podcast RSS feed into the same GCS bucket, rewriting episode enclosures to point at processed audio where ad reads are moved to the end.
+
+Example:
+
+```bash
+bun src/podcast-mirror.ts https://example.com/feed.xml --limit 3
+```
+
+Incremental workflow:
+
+- First run a subset (for speed/cost) using `--limit`, `--first`, `--last`, or one or more `--episode` filters.
+- Re-run later with a different subset. Episodes already present in the mirrored feed will be kept pointing at the mirrored enclosure URLs, so the mirror feed won’t regress on subsequent runs.

@@ -378,6 +378,7 @@ void createScript(async () => {
         // Generate and upload chapter HTML pages
         console.log(chalk.gray(`  Generating chapter HTML pages...`));
         const chapterPageUrls: Map<number, string> = new Map();
+        const episodeThumbnailUrl = `${GCS_BASE_URL}/${gcsPath}/thumbnail.png`;
         const allChapterPageInfo = chapters.map((c, i) => ({
             title: c.title,
             pageUrl: `${GCS_BASE_URL}/${gcsPath}/chapter-${i + 1}.html`,
@@ -408,6 +409,9 @@ void createScript(async () => {
                 totalChapters: chapters.length,
                 sourceUrl: url,
                 allChapters: allChapterPageInfo,
+                pageUrl: `${GCS_BASE_URL}/${gcsPath}/chapter-${i + 1}.html`,
+                episodeThumbnailUrl,
+                chapterImageUrl: imagesForHtml[0]?.gcsUrl,
             });
 
             const chapterHtmlFilename = `chapter-${i + 1}.html`;

@@ -16,7 +16,7 @@ REMOVE these types of content:
 KEEP these types of content:
 - The main article text
 - Relevant quotes and citations
-- Image descriptions (text in [Image: ...] format)
+- Markdown images like ![alt](url) and image descriptions (text in [Image: ...] format)
 - Relevant data, statistics, and examples
 - Author information if it provides context
 - Any content that contributes to understanding the topic

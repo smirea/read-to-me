@@ -7,6 +7,7 @@ import { claudeSonnetModel } from '../clients';
 import { argv } from '../cli';
 import { GEMINI_CONCURRENCY, PROMPTS_DIR } from '../constants';
 import type { ExtractedContent } from '../types';
+import { parseContentIntoSegments } from '../segments';
 
 const aiLimit = pLimit(GEMINI_CONCURRENCY);
 
@@ -24,11 +25,32 @@ async function enhanceChapterForTTS(
     ttsPrompt: string,
     chapterIndex: number,
 ): Promise<string> {
+    const segments = parseContentIntoSegments(chapterContent);
+    if (segments.some(s => s.type === 'image')) {
+        const enhancedSegments: string[] = [];
+        for (const segment of segments) {
+            if (segment.type === 'image') {
+                enhancedSegments.push(`[Image: ${segment.description}]`);
+                continue;
+            }
+            enhancedSegments.push(await enhanceTextBlockForTTS(segment.content, ttsPrompt, chapterIndex));
+        }
+        return enhancedSegments.join('\n\n');
+    }
+
+    return enhanceTextBlockForTTS(chapterContent, ttsPrompt, chapterIndex);
+}
+
+async function enhanceTextBlockForTTS(
+    text: string,
+    ttsPrompt: string,
+    chapterIndex: number,
+): Promise<string> {
     try {
         const result = await withRetry(
             async () => generateText({
                 model: claudeSonnetModel,
-                prompt: `${ttsPrompt}\n\n**Text to optimize:**\n\n${chapterContent}`,
+                prompt: `${ttsPrompt}\n\n**Text to optimize:**\n\n${text}`,
             }),
             'enhance for TTS'
         );
@@ -41,13 +63,13 @@ async function enhanceChapterForTTS(
         // Validate that we got SSML back
         if (!ssmlOutput.includes('<speak>')) {
             console.log(chalk.yellow(`    → Chapter ${chapterIndex + 1}: AI didn't return SSML, using original`));
-            return chapterContent;
+            return text;
         }
 
         return ssmlOutput;
     } catch (err) {
         console.log(chalk.yellow(`    → Chapter ${chapterIndex + 1}: Enhancement failed: ${(err as Error).message}`));
-        return chapterContent;
+        return text;
     }
 }
 

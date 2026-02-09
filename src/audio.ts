@@ -4,6 +4,7 @@ import { withRetry } from './utils/retry';
 import { ttsClient } from './clients';
 import { TTS_CONCURRENCY, TTS_SAMPLE_RATE } from './constants';
 import { parseChapterIntoSegments } from './segments';
+import { cleanTextForTTS, sanitizeTtsChunk } from './utils/tts-clean';
 import type { Chapter, ChapterAudio, ChapterWithSegments, ContentSegment, ExtractedContent } from './types';
 import { getOppositeGenderVoice, type EnglishDialect, type Voice } from './voice';
 
@@ -20,25 +21,6 @@ function getAudioDurationMs(buffer: Buffer): number {
 // =============================================================================
 // Text Chunking
 // =============================================================================
-
-/**
- * Clean up markdown for TTS (remove links, code blocks, etc.)
- */
-function cleanTextForTTS(content: string): string {
-    return content
-        .replace(/```[\s\S]*?```/g, '') // Remove code blocks
-        .replace(/`[^`]+`/g, '') // Remove inline code
-        // Replace markdown links with link text (handles nested parens in URLs)
-        .replace(/\[([^\]]*)\]\((?:[^()]*|\([^()]*\))*\)/g, '$1')
-        .replace(/\[\]\s*/g, '') // Remove any remaining empty brackets
-        .replace(/<https?:\/\/[^>]+>/g, '') // Remove autolinks <url>
-        .replace(/https?:\/\/[^\s<>[\]"']+/g, '') // Remove bare URLs
-        .replace(/\s+([.,!?;:])/g, '$1') // Clean up spaces before punctuation
-        .replace(/[#*_~]/g, '') // Remove markdown formatting
-        .replace(/\n{3,}/g, '\n\n') // Normalize multiple newlines
-        .replace(/  +/g, ' ') // Normalize multiple spaces
-        .trim();
-}
 
 /**
  * Split text into chunks suitable for TTS API (max ~4500 bytes per chunk).
@@ -255,7 +237,8 @@ async function synthesizeSegment(
         return Buffer.alloc(0);
     }
 
-    const chunks = isSSML ? splitSsmlIntoChunks(content) : splitTextIntoChunks(content);
+    const chunks = (isSSML ? splitSsmlIntoChunks(content) : splitTextIntoChunks(content))
+        .map(chunk => sanitizeTtsChunk(chunk, isSSML));
 
     const audioPromises = chunks.map((chunk, chunkIndex) =>
         ttsLimit(async () => {
@@ -361,10 +344,10 @@ async function synthesizeChapter(
 
     let chunks: string[];
     if (isSSML) {
-        chunks = splitSsmlIntoChunks(chapter.content);
+        chunks = splitSsmlIntoChunks(chapter.content).map(chunk => sanitizeTtsChunk(chunk, true));
     } else {
         const text = cleanTextForTTS(chapter.content);
-        chunks = splitTextIntoChunks(text);
+        chunks = splitTextIntoChunks(text).map(chunk => sanitizeTtsChunk(chunk, false));
     }
 
     const audioPromises = chunks.map((chunk, chunkIndex) =>

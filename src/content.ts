@@ -27,6 +27,18 @@ export function extractImagesFromMarkdown(content: string): string[] {
     return images;
 }
 
+function absolutizeMarkdownImageUrls(markdown: string, baseUrl: string): string {
+    const regex = new RegExp(MD_IMAGE_REGEX.source, 'g');
+    return markdown.replace(regex, (fullMatch, rawUrl: string) => {
+        try {
+            const abs = new URL(rawUrl, baseUrl).href;
+            return fullMatch.replace(rawUrl, abs);
+        } catch {
+            return fullMatch;
+        }
+    });
+}
+
 export async function fetchWebpage(url: string): Promise<string> {
     console.log(chalk.blue('Fetching webpage...'));
     const response = await fetchWithUA(url);
@@ -56,7 +68,7 @@ export function extractContent(html: string, url: string): ExtractedContent {
         codeBlockStyle: 'fenced',
     });
 
-    const markdown = turndown.turndown(articleContent);
+    const markdown = absolutizeMarkdownImageUrls(turndown.turndown(articleContent), url);
 
     // Extract images from the original content
     const imgRegex = /<img[^>]+src=["']([^"']+)["']/gi;
@@ -175,7 +187,7 @@ async function filterChapterContent(chapter: Chapter): Promise<Chapter> {
             console.log(chalk.green(`    → Filtered ${reduction}% non-article content`));
         }
 
-        return { ...chapter, content: filteredContent };
+        return { ...chapter, content: filteredContent, images: extractImagesFromMarkdown(filteredContent) };
     } catch (err) {
         console.log(chalk.yellow(`    → Filter error, keeping original: ${(err as Error).message}`));
         return chapter;

@@ -26,7 +26,7 @@ export const FAVICON_BORDER_WIDTH = 4;
 export const FAVICON_PADDING = 15;
 
 // Regex patterns
-export const MD_IMAGE_REGEX = /!\[.*?\]\(([^)]+)\)/g;
+export const MD_IMAGE_REGEX = /!\[[^\]]*]\(\s*([^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/g;
 
 // Cache configuration
 export const IMAGE_CACHE_DIR = path.join(process.cwd(), '.cache', 'read-to-me', 'images');

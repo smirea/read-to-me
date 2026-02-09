@@ -160,7 +160,7 @@ async function describeImage(imageUrl: string, context?: string): Promise<ImageD
 
 function extractContextForImage(content: string, imageUrl: string, charsBefore = 300, charsAfter = 150): string | undefined {
     const escapedUrl = imageUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const imgRegex = new RegExp(`!\\[.*?\\]\\(${escapedUrl}\\)`);
+    const imgRegex = new RegExp(`!\\[[^\\]]*\\]\\(\\s*${escapedUrl}(?:\\s+["'][^"']*["'])?\\s*\\)`);
     const match = imgRegex.exec(content);
 
     if (!match) return undefined;
@@ -194,12 +194,17 @@ export interface ProcessImagesResult {
 
 export async function processImagesInContent(content: ExtractedContent): Promise<ProcessImagesResult> {
     const cacheInfo = argv['cache-images'] ? ' (cache enabled)' : '';
-    console.log(chalk.blue(`Processing ${content.allImages.length} images (concurrency: ${GEMINI_CONCURRENCY})${cacheInfo}...`));
+    const imageUrlsInChapters = new Set<string>();
+    for (const chapter of content.chapters) {
+        for (const imgUrl of chapter.images) imageUrlsInChapters.add(imgUrl);
+    }
+    const imageUrls = [...imageUrlsInChapters];
+    console.log(chalk.blue(`Processing ${imageUrls.length} images (concurrency: ${GEMINI_CONCURRENCY})${cacheInfo}...`));
 
     const imageDescriptions = new Map<string, string>();
     let completed = 0;
     let cacheHits = 0;
-    const total = content.allImages.length;
+    const total = imageUrls.length;
     const skippedImages = new Set<string>();
 
     // Build a map of image URL to chapter content for context extraction
@@ -213,7 +218,7 @@ export async function processImagesInContent(content: ExtractedContent): Promise
     }
 
     // Process images in parallel with concurrency limit
-    const descriptionPromises = content.allImages.map((imgUrl) =>
+    const descriptionPromises = imageUrls.map((imgUrl) =>
         aiLimit(async () => {
             // Extract context from the chapter where this image appears
             const chapterContent = imageToChapterContent.get(imgUrl);
@@ -264,13 +269,15 @@ export async function processImagesInContent(content: ExtractedContent): Promise
 
         // Replace described images with their descriptions
         for (const [imgUrl, description] of imageDescriptions) {
-            const mdImgRegex = new RegExp(`!\\[.*?\\]\\(${imgUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`, 'g');
+            const escapedUrl = imgUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const mdImgRegex = new RegExp(`!\\[[^\\]]*\\]\\(\\s*${escapedUrl}(?:\\s+["'][^"']*["'])?\\s*\\)`, 'g');
             updatedContent = updatedContent.replace(mdImgRegex, `[Image: ${description}]`);
         }
 
         // Remove skipped images (stock photos, failed fetches, etc.) from content
         for (const imgUrl of skippedImages) {
-            const mdImgRegex = new RegExp(`!\\[.*?\\]\\(${imgUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)\\s*`, 'g');
+            const escapedUrl = imgUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const mdImgRegex = new RegExp(`!\\[[^\\]]*\\]\\(\\s*${escapedUrl}(?:\\s+["'][^"']*["'])?\\s*\\)\\s*`, 'g');
             updatedContent = updatedContent.replace(mdImgRegex, '');
         }
 
