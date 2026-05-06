@@ -3,9 +3,12 @@ import fs from 'fs';
 import path from 'path';
 
 import chalk from 'chalk';
-import { formatDate } from 'date-fns';
 import { env } from '../config';
 import _ from 'lodash';
+
+function formatTime(date: Date): string {
+    return date.toTimeString().slice(0, 8);
+}
 
 export async function createScript(fn: () => any) {
     process.on('unhandledRejection', err => {
@@ -48,7 +51,7 @@ export const cmd = (() => {
 
     return Object.assign(function cmd(command: string, options?: ExecSyncOptions) {
         console.log(
-            chalk.gray(`[${formatDate(new Date(), 'HH:mm:ss')}]`),
+            chalk.gray(`[${formatTime(new Date())}]`),
             chalk.bold('run cmd:'),
             chalk.green(command),
         );

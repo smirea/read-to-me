@@ -44,30 +44,44 @@ function stripCodeFences(text: string): string {
     return text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
 }
 
+function parseLabels(text: string): AdSegmentLabel[] {
+    const raw = stripCodeFences(text);
+
+    try {
+        return JSON.parse(raw) as AdSegmentLabel[];
+    } catch {
+        const start = raw.indexOf('[');
+        const end = raw.lastIndexOf(']');
+        if (start >= 0 && end > start) {
+            return JSON.parse(raw.slice(start, end + 1)) as AdSegmentLabel[];
+        }
+        throw new Error(`Invalid ad-label JSON response: ${raw.slice(0, 300)}`);
+    }
+}
+
 export async function classifyAdSegments(segments: TranscriptSegment[]): Promise<AdSegmentLabel[]> {
     if (segments.length === 0) return [];
 
     const prompt = await loadPrompt();
     const batches = chunkSegments(segments);
 
-    const results = await Promise.all(batches.map(batch => aiLimit(async () => {
-        const response = await withRetry(
-            async () => generateText({
+    const results = await Promise.all(batches.map(batch => aiLimit(async () => withRetry(
+        async () => {
+            const response = await generateText({
                 model: geminiFlashModel,
                 prompt: `${prompt}\n\nSEGMENTS:\n${JSON.stringify(batch, null, 2)}`,
-            }),
-            'classify ad segments'
-        );
+            });
 
-        const raw = stripCodeFences(response.text);
-        const parsed = JSON.parse(raw) as AdSegmentLabel[];
-        return parsed;
-    })));
+            return parseLabels(response.text);
+        },
+        'classify ad segments',
+        2,
+    ))));
 
     const flattened = results.flat();
     const labelMap = new Map<number, AdSegmentLabel>();
     for (const label of flattened) {
-        if (typeof label?.index === 'number' && (label.label === 'ad' || label.label === 'content')) {
+        if (typeof label?.index === 'number' && (label.label === 'ad' || label.label === 'content' || label.label === 'interaction_reminder')) {
             labelMap.set(label.index, label);
         }
     }
@@ -81,7 +95,8 @@ export async function classifyAdSegments(segments: TranscriptSegment[]): Promise
     });
 
     const adCount = finalLabels.filter(l => l.label === 'ad').length;
-    console.log(chalk.green(`  AI labeled ${adCount}/${segments.length} segments as ads`));
+    const interactionCount = finalLabels.filter(l => l.label === 'interaction_reminder').length;
+    console.log(chalk.green(`  AI labeled ${adCount}/${segments.length} segments as ads, ${interactionCount}/${segments.length} as interaction reminders`));
 
     return finalLabels;
 }

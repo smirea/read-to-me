@@ -109,7 +109,7 @@ export interface TranscriptSegment {
 
 export interface AdSegmentLabel {
     index: number;
-    label: 'ad' | 'content';
+    label: 'ad' | 'content' | 'interaction_reminder';
     reason?: string;
 }
 

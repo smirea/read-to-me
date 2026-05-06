@@ -1,4 +1,5 @@
 import { gcsClient } from './clients';
+import { withRetry } from './utils/retry';
 
 /**
  * Upload a file to Google Cloud Storage.
@@ -13,10 +14,14 @@ export async function uploadToGCS(localPath: string, gcsPath: string, contentTyp
     const objectPath = parts.slice(1).join('/');
 
     const bucket = gcsClient.bucket(bucketName);
-    await bucket.upload(localPath, {
-        destination: objectPath,
-        ...(contentType && { contentType }),
-    });
+    await withRetry(
+        async () => bucket.upload(localPath, {
+            destination: objectPath,
+            ...(contentType && { contentType }),
+        }),
+        `upload ${objectPath}`,
+        2,
+    );
 }
 
 /**

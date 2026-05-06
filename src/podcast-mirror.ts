@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import chalk from 'chalk';
 import path from 'path';
-import { mkdir, stat, unlink, writeFile, copyFile } from 'fs/promises';
+import { mkdir, stat, unlink, writeFile, copyFile, readFile } from 'fs/promises';
 import { XMLParser, XMLBuilder } from 'fast-xml-parser';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
@@ -18,6 +18,7 @@ import { classifyAdSegments } from './ai/ad-detection';
 import { resolveVoice, DEFAULT_VOICE, VOICE_NAMES, ENGLISH_DIALECTS, type EnglishDialect } from './voice';
 import { gcsClient, ttsClient } from './clients';
 import { applyMirroredItemFields, buildMergedMirrorItems, computeEpisodeSlug, extractEpisodeSlug, slugify } from './podcast-mirror/feed-utils';
+import { isInteractionReminderText } from './podcast-mirror/interaction-reminder';
 import type { TranscriptSegment, TranscriptWord } from './types';
 
 const argv = yargs(hideBin(process.argv))
@@ -188,10 +189,6 @@ async function downloadFile(url: string, destPath: string): Promise<void> {
     if (!response.ok) {
         throw new Error(`Failed to download ${url}: ${response.status}`);
     }
-    if (response.body) {
-        await Bun.write(destPath, response.body);
-        return;
-    }
     const data = await response.arrayBuffer();
     await Bun.write(destPath, Buffer.from(data));
 }
@@ -344,12 +341,12 @@ function mergeAdRanges(ranges: Array<{ startSec: number; endSec: number }>): Arr
 
 function invertRanges(
     totalDurationSec: number,
-    adRanges: Array<{ startSec: number; endSec: number }>
+    removedRanges: Array<{ startSec: number; endSec: number }>
 ): Array<{ startSec: number; endSec: number }> {
     const keep: Array<{ startSec: number; endSec: number }> = [];
     let cursor = 0;
 
-    for (const range of adRanges) {
+    for (const range of removedRanges) {
         if (range.startSec > cursor) {
             keep.push({ startSec: cursor, endSec: range.startSec });
         }
@@ -363,9 +360,9 @@ function invertRanges(
     return keep.filter(r => r.endSec - r.startSec > 0.1);
 }
 
-function adjustChapterStart(originalSec: number, adRanges: Array<{ startSec: number; endSec: number }>): number {
+function adjustChapterStart(originalSec: number, removedRanges: Array<{ startSec: number; endSec: number }>): number {
     let shift = 0;
-    for (const range of adRanges) {
+    for (const range of removedRanges) {
         if (range.endSec <= originalSec) {
             shift += range.endSec - range.startSec;
         } else if (range.startSec < originalSec) {
@@ -454,7 +451,7 @@ async function concatSegments(
 
 function buildChapters(
     originalChapters: Array<{ title: string; startSec: number }>,
-    adRanges: Array<{ startSec: number; endSec: number }>,
+    removedRanges: Array<{ startSec: number; endSec: number }>,
     mainDurationSec: number,
     includeAds: boolean,
     adCount: number,
@@ -462,7 +459,7 @@ function buildChapters(
     const adjusted = originalChapters
         .map(chapter => ({
             title: chapter.title || 'Chapter',
-            startSec: adjustChapterStart(chapter.startSec, adRanges),
+            startSec: adjustChapterStart(chapter.startSec, removedRanges),
         }))
         .filter(chapter => chapter.startSec < mainDurationSec)
         .sort((a, b) => a.startSec - b.startSec);
@@ -630,6 +627,7 @@ void createScript(async () => {
         const enclosure = item.enclosure || {};
         const enclosureUrl = enclosure['@_url'] as string;
         const enclosureType = enclosure['@_type'] as string | undefined;
+        const { ext, mime, codec } = guessAudioFormat(enclosureUrl, enclosureType);
 
         if (!enclosureUrl) {
             console.log(chalk.yellow(`  ⚠ Skipping episode without enclosure: ${title}`));
@@ -637,13 +635,21 @@ void createScript(async () => {
         }
 
         const episodeDir = path.join(baseOutputDir, episodeSlug);
+        const outputAudioPath = path.join(episodeDir, `${episodeSlug}.${ext}`);
         const alreadyInFeed = existingSlugs.has(episodeSlug);
-        let localExists = false;
+        let localOutputExists = false;
         try {
             const existingStat = await stat(episodeDir);
-            localExists = existingStat.isDirectory();
+            if (existingStat.isDirectory()) {
+                try {
+                    const localOutputStat = await stat(outputAudioPath);
+                    localOutputExists = localOutputStat.isFile();
+                } catch {
+                    localOutputExists = false;
+                }
+            }
         } catch {
-            localExists = false;
+            localOutputExists = false;
         }
 
         if (alreadyInFeed) {
@@ -657,7 +663,7 @@ void createScript(async () => {
             continue;
         }
 
-        if (localExists) {
+        if (localOutputExists) {
             console.log(chalk.yellow(`  ↷ Skipping existing local output: ${title}`));
             continue;
         }
@@ -666,9 +672,8 @@ void createScript(async () => {
 
         console.log(chalk.blue.bold(`Episode ${originalIndex + 1}: ${title}`));
 
-        const { ext, mime, codec } = guessAudioFormat(enclosureUrl, enclosureType);
         const originalPath = path.join(episodeDir, `original.${ext}`);
-        const outputAudioPath = path.join(episodeDir, `${episodeSlug}.${ext}`);
+        const transcriptWordsPath = path.join(episodeDir, 'transcript-words.json');
 
         console.log(chalk.gray('  Downloading audio...'));
         await fetchLimit(() => downloadFile(enclosureUrl, originalPath));
@@ -676,9 +681,33 @@ void createScript(async () => {
         const audioInfo = await getAudioInfo(originalPath);
         console.log(chalk.gray(`  Duration: ${audioInfo.durationSec.toFixed(1)}s`));
 
-        console.log(chalk.gray('  Transcribing audio...'));
-        const transcriptionObjectPath = `${gcsRoot}/transcripts/${episodeSlug}.flac`;
-        const words = await transcribeAudioWithTimestamps(speechClient, originalPath, transcriptionObjectPath, languageCode);
+        let words: TranscriptWord[];
+        try {
+            const cachedWordsRaw = await readFile(transcriptWordsPath, 'utf-8');
+            const cachedWords = JSON.parse(cachedWordsRaw) as TranscriptWord[];
+            if (!Array.isArray(cachedWords) || cachedWords.length === 0) {
+                throw new Error('invalid transcript cache shape');
+            }
+            const looksValid = cachedWords.every(word =>
+                typeof word?.word === 'string'
+                && typeof word?.startSec === 'number'
+                && Number.isFinite(word.startSec)
+                && typeof word?.endSec === 'number'
+                && Number.isFinite(word.endSec)
+                && word.endSec >= word.startSec
+            );
+            const maxEndSec = cachedWords.reduce((max, word) => Math.max(max, word.endSec), 0);
+            if (!looksValid || maxEndSec < 30) {
+                throw new Error('invalid transcript cache timestamps');
+            }
+            words = cachedWords;
+            console.log(chalk.gray(`  Reusing transcript words cache: ${words.length}`));
+        } catch {
+            console.log(chalk.gray('  Transcribing audio...'));
+            const transcriptionObjectPath = `${gcsRoot}/transcripts/${episodeSlug}.flac`;
+            words = await transcribeAudioWithTimestamps(speechClient, originalPath, transcriptionObjectPath, languageCode);
+            await writeFile(transcriptWordsPath, JSON.stringify(words), 'utf-8');
+        }
         console.log(chalk.gray(`  Transcript words: ${words.length}`));
 
         const segments = buildTranscriptSegments(words);
@@ -687,22 +716,53 @@ void createScript(async () => {
         console.log(chalk.gray('  Detecting ad reads...'));
         const labels = await classifyAdSegments(segments);
         const labelMap = new Map(labels.map(label => [label.index, label.label]));
+        const interactionReminderSegmentIndexes = new Set(
+            segments
+                .filter(segment => {
+                    const label = labelMap.get(segment.index);
+                    if (label === 'interaction_reminder') return true;
+                    return isInteractionReminderText(segment.text);
+                })
+                .map(segment => segment.index)
+        );
+
         const adSegments = segments
-            .filter(segment => labelMap.get(segment.index) === 'ad')
+            .filter(segment => labelMap.get(segment.index) === 'ad' && !interactionReminderSegmentIndexes.has(segment.index))
+            .map(segment => ({
+                startSec: Math.max(0, segment.startSec - AD_PADDING_SEC),
+                endSec: Math.min(audioInfo.durationSec, segment.endSec + AD_PADDING_SEC),
+            }));
+
+        const interactionReminderSegments = segments
+            .filter(segment => interactionReminderSegmentIndexes.has(segment.index))
             .map(segment => ({
                 startSec: Math.max(0, segment.startSec - AD_PADDING_SEC),
                 endSec: Math.min(audioInfo.durationSec, segment.endSec + AD_PADDING_SEC),
             }));
 
         const mergedAdRanges = mergeAdRanges(adSegments);
+        const mergedInteractionReminderRanges = mergeAdRanges(interactionReminderSegments);
+        const mergedRemovedRanges = mergeAdRanges([...mergedAdRanges, ...mergedInteractionReminderRanges]);
         const adDuration = mergedAdRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
+        const interactionReminderDuration = mergedInteractionReminderRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
+        const removedDuration = mergedRemovedRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
 
-        if (mergedAdRanges.length === 0) {
-            console.log(chalk.yellow('  No ad segments detected; mirroring original audio'));
+        if (mergedRemovedRanges.length === 0) {
+            console.log(chalk.yellow('  No ad or interaction-reminder segments detected; mirroring original audio'));
             await copyFile(originalPath, outputAudioPath);
         } else {
-            console.log(chalk.green(`  Detected ${mergedAdRanges.length} ad ranges (${adDuration.toFixed(1)}s)`));
-            const keepRanges = invertRanges(audioInfo.durationSec, mergedAdRanges);
+            if (mergedAdRanges.length > 0) {
+                console.log(chalk.green(`  Detected ${mergedAdRanges.length} ad ranges (${adDuration.toFixed(1)}s)`));
+            }
+            if (mergedInteractionReminderRanges.length > 0) {
+                console.log(chalk.green(`  Removing ${mergedInteractionReminderRanges.length} interaction-reminder ranges (${interactionReminderDuration.toFixed(1)}s)`));
+            }
+
+            const keepRanges = invertRanges(audioInfo.durationSec, mergedRemovedRanges);
+            if (keepRanges.length === 0) {
+                throw new Error('All transcript segments were marked for removal');
+            }
+
             const segmentDir = path.join(episodeDir, 'segments');
             await mkdir(segmentDir, { recursive: true });
 
@@ -720,12 +780,15 @@ void createScript(async () => {
                 adFiles.push(segmentPath);
             }
 
-            const announcementPath = path.join(segmentDir, 'announcement.wav');
-            const announcementText = `starting ${mergedAdRanges.length} spliced ad ${mergedAdRanges.length === 1 ? 'read' : 'reads'}`;
-            await synthesizeAnnouncement(announcementText, announcementPath, audioInfo.sampleRate, audioInfo.channels, voice, dialect);
-
             const bitRateKbps = Math.max(64, Math.round((audioInfo.bitRate ?? 128000) / 1000));
-            const concatOrder = [...keepFiles, announcementPath, ...adFiles];
+            const concatOrder = [...keepFiles];
+            if (mergedAdRanges.length > 0) {
+                const announcementPath = path.join(segmentDir, 'announcement.wav');
+                const announcementText = `starting ${mergedAdRanges.length} spliced ad ${mergedAdRanges.length === 1 ? 'read' : 'reads'}`;
+                await synthesizeAnnouncement(announcementText, announcementPath, audioInfo.sampleRate, audioInfo.channels, voice, dialect);
+                concatOrder.push(announcementPath, ...adFiles);
+            }
+
             await concatSegments(concatOrder, outputAudioPath, codec, audioInfo.sampleRate, audioInfo.channels, bitRateKbps);
         }
 
@@ -737,13 +800,13 @@ void createScript(async () => {
             startSec: parseChapterStart(chapter['@_start'] || '0:00:00'),
         }));
 
-        const mainDurationSec = mergedAdRanges.length > 0
-            ? Math.max(0, audioInfo.durationSec - adDuration)
+        const mainDurationSec = mergedRemovedRanges.length > 0
+            ? Math.max(0, audioInfo.durationSec - removedDuration)
             : outputInfo.durationSec;
 
         const chapters = buildChapters(
             originalChapters,
-            mergedAdRanges,
+            mergedRemovedRanges,
             mainDurationSec,
             mergedAdRanges.length > 0,
             mergedAdRanges.length,
