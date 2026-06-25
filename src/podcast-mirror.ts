@@ -11,6 +11,7 @@ import { SpeechClient } from '@google-cloud/speech';
 import { createScript, style } from './utils/createScript';
 import { fetchWithUA } from './utils/fetch';
 import { formatMs, formatChapterTime, parseTimeToMs } from './utils/time';
+import { withRetry } from './utils/retry';
 import { FETCH_CONCURRENCY, GCS_BASE_URL, GCS_BUCKET, TTS_SAMPLE_RATE } from './constants';
 import { uploadToGCS } from './upload';
 import { generateJsonChapters } from './output';
@@ -237,7 +238,16 @@ async function transcribeAudioWithTimestamps(
         },
     });
 
-    const [response] = await operation.promise();
+    const operationName = (operation as { name?: string }).name;
+    if (operationName) {
+        console.log(chalk.gray(`  Speech operation: ${operationName}`));
+    }
+
+    const [response] = await withRetry(
+        () => operation.promise(),
+        'wait for speech operation',
+        3,
+    );
 
     const words: TranscriptWord[] = [];
     for (const result of response.results ?? []) {
