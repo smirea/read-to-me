@@ -20,6 +20,8 @@ import { resolveVoice, DEFAULT_VOICE, VOICE_NAMES, ENGLISH_DIALECTS, type Englis
 import { gcsClient, ttsClient } from './clients';
 import { applyMirroredItemFields, buildMergedMirrorItems, computeEpisodeSlug, extractEpisodeSlug, slugify } from './podcast-mirror/feed-utils';
 import { isInteractionReminderText } from './podcast-mirror/interaction-reminder';
+import { prefixMirrorText, renderMirrorArtwork } from './podcast-mirror/artwork';
+import { detectSponsorKeywordRanges } from './podcast-mirror/sponsor-detection';
 import type { TranscriptSegment, TranscriptWord } from './types';
 
 const argv = yargs(hideBin(process.argv))
@@ -103,6 +105,12 @@ function setText(node: any, text: string): any {
         return { ...node, '#text': text };
     }
     return text;
+}
+
+function prefixTextNode(node: any): any {
+    const text = getText(node);
+    if (!text) return node;
+    return setText(node, prefixMirrorText(text));
 }
 
 function parseChapterStart(start: string): number {
@@ -516,6 +524,154 @@ function updateAtomSelfLink(channel: any, feedUrl: string) {
     }
 }
 
+function getItunesImageUrl(value: any): string {
+    const image = Array.isArray(value) ? value[0] : value;
+    const href = image?.['@_href'];
+    return typeof href === 'string' ? href : '';
+}
+
+function getArtworkUrl(node: any): string {
+    return getItunesImageUrl(node?.['itunes:image']) || getText(node?.image?.url);
+}
+
+function setItunesImageUrl(node: any, url: string): any {
+    const current = Array.isArray(node) ? node[0] : node;
+    if (current && typeof current === 'object') {
+        return { ...current, '@_href': url };
+    }
+    return { '@_href': url };
+}
+
+function setChannelArtwork(channel: any, artworkUrl: string, title: string): void {
+    channel['itunes:image'] = setItunesImageUrl(channel['itunes:image'], artworkUrl);
+    channel.image ??= {};
+    channel.image.url = setText(channel.image.url, artworkUrl);
+    channel.image.title = setText(channel.image.title, title);
+    if (!channel.image.link && channel.link) {
+        channel.image.link = channel.link;
+    }
+}
+
+function setEpisodeArtwork(item: any, artworkUrl: string): void {
+    item['itunes:image'] = setItunesImageUrl(item['itunes:image'], artworkUrl);
+    if (item.image?.url) {
+        item.image.url = setText(item.image.url, artworkUrl);
+    }
+}
+
+function brandEpisodeTitle(item: any): void {
+    item.title = prefixTextNode(item.title);
+    if (item['itunes:title']) {
+        item['itunes:title'] = prefixTextNode(item['itunes:title']);
+    }
+}
+
+async function renderAndUploadArtwork(
+    sourceUrl: string,
+    outputPath: string,
+    gcsObjectPath: string,
+    publicUrl: string,
+    skipUpload: boolean,
+): Promise<string | null> {
+    try {
+        await renderMirrorArtwork(sourceUrl, outputPath);
+        if (!skipUpload) {
+            await uploadToGCS(outputPath, `${GCS_BUCKET}/${gcsObjectPath}`, 'image/png');
+        }
+        return publicUrl;
+    } catch (error) {
+        console.log(chalk.yellow(`  ⚠ Could not brand artwork: ${error instanceof Error ? error.message : String(error)}`));
+        return null;
+    }
+}
+
+async function brandChannelArtwork(channel: any, baseOutputDir: string, gcsRoot: string, gcsFeedUrl: string, skipUpload: boolean): Promise<void> {
+    const sourceUrl = getArtworkUrl(channel);
+    if (!sourceUrl) return;
+
+    const artworkPath = path.join(baseOutputDir, '_artwork', 'channel.png');
+    const gcsObjectPath = `${gcsRoot}/_artwork/channel.png`;
+    const artworkUrl = `${GCS_BASE_URL}/${gcsObjectPath}`;
+    const uploadedUrl = await renderAndUploadArtwork(sourceUrl, artworkPath, gcsObjectPath, artworkUrl, skipUpload);
+    if (!uploadedUrl) return;
+
+    setChannelArtwork(channel, uploadedUrl, getText(channel.title) || 'Podcast');
+    updateAtomSelfLink(channel, gcsFeedUrl);
+}
+
+async function brandEpisodeArtwork(item: any, episodeDir: string, gcsEpisodePath: string, episodeSlug: string, skipUpload: boolean): Promise<void> {
+    const sourceUrl = getArtworkUrl(item);
+    if (!sourceUrl) return;
+
+    const artworkPath = path.join(episodeDir, `${episodeSlug}-artwork.png`);
+    const gcsObjectPath = `${gcsEpisodePath}/${episodeSlug}-artwork.png`;
+    const artworkUrl = `${GCS_BASE_URL}/${gcsObjectPath}`;
+    const uploadedUrl = await renderAndUploadArtwork(sourceUrl, artworkPath, gcsObjectPath, artworkUrl, skipUpload);
+    if (!uploadedUrl) return;
+
+    setEpisodeArtwork(item, uploadedUrl);
+}
+
+async function readExistingChapters(chaptersJsonPath: string): Promise<Array<{ title: string; startMs: number }> | null> {
+    try {
+        const raw = await readFile(chaptersJsonPath, 'utf-8');
+        const parsed = JSON.parse(raw) as { chapters?: Array<{ title?: string; startTime?: number }> };
+        const chapters = parsed.chapters
+            ?.filter(chapter => typeof chapter.startTime === 'number')
+            .map(chapter => ({
+                title: chapter.title || 'Chapter',
+                startMs: Math.round((chapter.startTime ?? 0) * 1000),
+            }));
+
+        return chapters && chapters.length > 0 ? chapters : null;
+    } catch {
+        return null;
+    }
+}
+
+async function applyLocalOutputFields(options: {
+    item: any;
+    outputAudioPath: string;
+    chaptersJsonPath: string;
+    gcsEpisodePath: string;
+    episodeSlug: string;
+    ext: string;
+    mime: string;
+}): Promise<{ size: number }> {
+    const outputInfo = await getAudioInfo(options.outputAudioPath);
+    const outputStats = await stat(options.outputAudioPath);
+    const audioUrl = `${GCS_BASE_URL}/${options.gcsEpisodePath}/${options.episodeSlug}.${options.ext}`;
+    const chaptersJsonUrl = `${GCS_BASE_URL}/${options.gcsEpisodePath}/${options.episodeSlug}-chapters.json`;
+    const existingChapters = await readExistingChapters(options.chaptersJsonPath);
+    const chapters = existingChapters ?? [{ title: 'Episode', startMs: 0 }];
+    if (!existingChapters) {
+        await writeFile(options.chaptersJsonPath, JSON.stringify(generateJsonChapters(chapters, getText(options.item.link)), null, 2), 'utf-8');
+    }
+
+    options.item.enclosure = {
+        ...options.item.enclosure,
+        '@_url': audioUrl,
+        '@_length': String(outputStats.size),
+        '@_type': options.mime,
+    };
+
+    options.item.guid = updateGuid(options.item.guid, audioUrl);
+    options.item['itunes:duration'] = setText(options.item['itunes:duration'], formatMs(Math.round(outputInfo.durationSec * 1000)));
+    options.item['psc:chapters'] = {
+        '@_version': '1.2',
+        'psc:chapter': chapters.map(chapter => ({
+            '@_start': formatChapterTime(chapter.startMs),
+            '@_title': chapter.title,
+        })),
+    };
+    options.item['podcast:chapters'] = {
+        '@_url': chaptersJsonUrl,
+        '@_type': 'application/json+chapters',
+    };
+
+    return { size: outputStats.size };
+}
+
 void createScript(async () => {
     const feedUrl = argv.feedUrl as string;
     const outputDir = argv.output ? path.resolve(argv.output) : null;
@@ -572,8 +728,8 @@ void createScript(async () => {
     parsed.rss['@_xmlns:podcast'] ??= 'https://podcastindex.org/namespace/1.0';
 
     const originalTitle = getText(channel.title) || 'Podcast';
-    const mirrorTitle = `R2M: ${originalTitle}`;
-    const mirrorSlug = slugify(mirrorTitle, 80) || 'r2m-podcast';
+    const mirrorTitle = prefixMirrorText(originalTitle);
+    const mirrorSlug = slugify(`R2M: ${originalTitle}`, 80) || 'r2m-podcast';
     const gcsRoot = mirrorSlug;
     const gcsFeedUrl = `${GCS_BASE_URL}/${gcsRoot}/feed.xml`;
 
@@ -594,6 +750,10 @@ void createScript(async () => {
         const guidValue = getText(item.guid) || (typeof enclosureUrl === 'string' ? enclosureUrl : '');
         return computeEpisodeSlug(title, guidValue, index + 1);
     });
+
+    for (const item of items) {
+        brandEpisodeTitle(item);
+    }
 
     const itemsWithIndex = items.map((item, index) => ({
         item,
@@ -627,7 +787,11 @@ void createScript(async () => {
 
     const baseOutputDir = outputDir || path.join(process.cwd(), 'output', mirrorSlug);
     await mkdir(baseOutputDir, { recursive: true });
-    const existingMirror = await fetchExistingMirrorItems(gcsFeedUrl, gcsRoot);
+    const existingMirror = await fetchExistingMirrorItems(`${gcsFeedUrl}?fresh=${Date.now()}`, gcsRoot);
+    for (const item of existingMirror.itemsBySlug.values()) {
+        brandEpisodeTitle(item);
+    }
+    await brandChannelArtwork(channel, baseOutputDir, gcsRoot, gcsFeedUrl, skipUpload);
     const existingSlugs = new Set(existingMirror.itemsBySlug.keys());
     const processedSlugs = new Set<string>();
 
@@ -646,6 +810,8 @@ void createScript(async () => {
 
         const episodeDir = path.join(baseOutputDir, episodeSlug);
         const outputAudioPath = path.join(episodeDir, `${episodeSlug}.${ext}`);
+        const chaptersJsonPath = path.join(episodeDir, `${episodeSlug}-chapters.json`);
+        const gcsEpisodePath = `${gcsRoot}/${episodeSlug}`;
         const alreadyInFeed = existingSlugs.has(episodeSlug);
         let localOutputExists = false;
         try {
@@ -666,6 +832,8 @@ void createScript(async () => {
             const mirroredItem = existingMirror.itemsBySlug.get(episodeSlug);
             if (mirroredItem) {
                 applyMirroredItemFields(item, mirroredItem);
+                await mkdir(episodeDir, { recursive: true });
+                await brandEpisodeArtwork(item, episodeDir, gcsEpisodePath, episodeSlug, skipUpload);
                 console.log(chalk.yellow(`  ↷ Skipping already imported: ${title}`));
             } else {
                 console.log(chalk.yellow(`  ↷ Skipping already imported (missing mirrored metadata): ${title}`));
@@ -674,7 +842,26 @@ void createScript(async () => {
         }
 
         if (localOutputExists) {
-            console.log(chalk.yellow(`  ↷ Skipping existing local output: ${title}`));
+            console.log(chalk.yellow(`  ↷ Reusing existing local output: ${title}`));
+            const outputStats = await applyLocalOutputFields({
+                item,
+                outputAudioPath,
+                chaptersJsonPath,
+                gcsEpisodePath,
+                episodeSlug,
+                ext,
+                mime,
+            });
+            await brandEpisodeArtwork(item, episodeDir, gcsEpisodePath, episodeSlug, skipUpload);
+            if (!skipUpload) {
+                console.log(chalk.gray('  Uploading cached processed audio...'));
+                await uploadToGCS(outputAudioPath, `${GCS_BUCKET}/${gcsEpisodePath}/${episodeSlug}.${ext}`, mime);
+                console.log(chalk.gray('  Uploading cached chapters JSON...'));
+                await uploadToGCS(chaptersJsonPath, `${GCS_BUCKET}/${gcsEpisodePath}/${episodeSlug}-chapters.json`, 'application/json');
+            }
+            processedSlugs.add(episodeSlug);
+            console.log(chalk.green(`  ✓ ${episodeSlug}.${ext} (${(outputStats.size / 1024 / 1024).toFixed(1)} MB)`));
+            console.log();
             continue;
         }
 
@@ -685,8 +872,14 @@ void createScript(async () => {
         const originalPath = path.join(episodeDir, `original.${ext}`);
         const transcriptWordsPath = path.join(episodeDir, 'transcript-words.json');
 
-        console.log(chalk.gray('  Downloading audio...'));
-        await fetchLimit(() => downloadFile(enclosureUrl, originalPath));
+        try {
+            const originalStats = await stat(originalPath);
+            if (!originalStats.isFile()) throw new Error('not a file');
+            console.log(chalk.gray('  Reusing original audio cache'));
+        } catch {
+            console.log(chalk.gray('  Downloading audio...'));
+            await fetchLimit(() => downloadFile(enclosureUrl, originalPath));
+        }
 
         const audioInfo = await getAudioInfo(originalPath);
         console.log(chalk.gray(`  Duration: ${audioInfo.durationSec.toFixed(1)}s`));
@@ -742,6 +935,7 @@ void createScript(async () => {
                 startSec: Math.max(0, segment.startSec - AD_PADDING_SEC),
                 endSec: Math.min(audioInfo.durationSec, segment.endSec + AD_PADDING_SEC),
             }));
+        const sponsorKeywordRanges = detectSponsorKeywordRanges(words, audioInfo.durationSec);
 
         const interactionReminderSegments = segments
             .filter(segment => interactionReminderSegmentIndexes.has(segment.index))
@@ -750,7 +944,7 @@ void createScript(async () => {
                 endSec: Math.min(audioInfo.durationSec, segment.endSec + AD_PADDING_SEC),
             }));
 
-        const mergedAdRanges = mergeAdRanges(adSegments);
+        const mergedAdRanges = mergeAdRanges([...adSegments, ...sponsorKeywordRanges]);
         const mergedInteractionReminderRanges = mergeAdRanges(interactionReminderSegments);
         const mergedRemovedRanges = mergeAdRanges([...mergedAdRanges, ...mergedInteractionReminderRanges]);
         const adDuration = mergedAdRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
@@ -763,6 +957,10 @@ void createScript(async () => {
         } else {
             if (mergedAdRanges.length > 0) {
                 console.log(chalk.green(`  Detected ${mergedAdRanges.length} ad ranges (${adDuration.toFixed(1)}s)`));
+            }
+            if (sponsorKeywordRanges.length > 0) {
+                const hits = sponsorKeywordRanges.flatMap(range => range.hits);
+                console.log(chalk.green(`  Sponsor keyword backstop: ${sponsorKeywordRanges.length} range(s), ${[...new Set(hits)].join(', ')}`));
             }
             if (mergedInteractionReminderRanges.length > 0) {
                 console.log(chalk.green(`  Removing ${mergedInteractionReminderRanges.length} interaction-reminder ranges (${interactionReminderDuration.toFixed(1)}s)`));
@@ -827,10 +1025,8 @@ void createScript(async () => {
             getText(item.link)
         );
 
-        const chaptersJsonPath = path.join(episodeDir, `${episodeSlug}-chapters.json`);
         await writeFile(chaptersJsonPath, JSON.stringify(chaptersJson, null, 2), 'utf-8');
 
-        const gcsEpisodePath = `${gcsRoot}/${episodeSlug}`;
         const audioUrl = `${GCS_BASE_URL}/${gcsEpisodePath}/${episodeSlug}.${ext}`;
         const chaptersJsonUrl = `${GCS_BASE_URL}/${gcsEpisodePath}/${episodeSlug}-chapters.json`;
 
@@ -856,6 +1052,7 @@ void createScript(async () => {
             '@_url': chaptersJsonUrl,
             '@_type': 'application/json+chapters',
         };
+        await brandEpisodeArtwork(item, episodeDir, gcsEpisodePath, episodeSlug, skipUpload);
 
         if (!skipUpload) {
             console.log(chalk.gray('  Uploading processed audio...'));
