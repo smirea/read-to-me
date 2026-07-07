@@ -19,6 +19,20 @@ const podcasts = [
 
 const RECENT_DAYS = 7;
 const projectRoot = path.resolve(import.meta.dir, '..');
+const bunExecutable = process.execPath;
+
+ensurePath([
+    path.dirname(bunExecutable),
+    process.env.HOME ? path.join(process.env.HOME, '.bun', 'bin') : '',
+    process.env.HOME ? path.join(process.env.HOME, '.local', 'bin') : '',
+    process.env.HOME ? path.join(process.env.HOME, 'bin') : '',
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+]);
 
 interface FeedItem {
     title: string;
@@ -66,7 +80,7 @@ async function runCron(): Promise<void> {
 
         const episodeArgs = episodesToParse.flatMap(episode => ['--episode', episode.title]);
         await runCommand([
-            'bun',
+            bunExecutable,
             'src/podcast-mirror.ts',
             podcast.feedUrl,
             ...episodeArgs,
@@ -168,6 +182,14 @@ function getText(value: any): string {
 function ensureArray<T>(value: T | T[] | undefined | null): T[] {
     if (!value) return [];
     return Array.isArray(value) ? value : [value];
+}
+
+function ensurePath(paths: string[]): void {
+    const entries = [
+        ...paths,
+        ...(process.env.PATH ?? '').split(':'),
+    ].filter(Boolean);
+    process.env.PATH = [...new Set(entries)].join(':');
 }
 
 function parsePubDate(value: string): Date | null {

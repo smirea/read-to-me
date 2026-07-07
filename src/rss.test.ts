@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { generateRssFeed } from './output/rss';
+import { generateJsonChapters, generateRssFeed } from './output/rss';
 
 describe('rss generation', () => {
     test('psc chapter start uses HH:MM:SS.mmm', () => {
@@ -22,5 +22,12 @@ describe('rss generation', () => {
         expect(xml).toContain('<psc:chapter start="00:00:00.000"');
         expect(xml).toContain('<psc:chapter start="00:00:01.234"');
     });
-});
 
+    test('json chapter start time uses seconds with millisecond precision', () => {
+        const json = generateJsonChapters([
+            { title: 'c1', startMs: 1_234 },
+        ]);
+
+        expect(json.chapters[0].startTime).toBe(1.234);
+    });
+});
