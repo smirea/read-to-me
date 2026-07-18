@@ -71,7 +71,7 @@ When uploaded (default), also updates the master RSS feed at:
 
 ## Podcast Mirror (Ad Splicing)
 
-`src/podcast-mirror.ts` mirrors an existing podcast RSS feed into the same GCS bucket, rewriting episode enclosures to point at processed audio where ad reads are moved to the end.
+`src/podcast-mirror.ts` mirrors an existing podcast RSS feed into the same GCS bucket, rewriting episode enclosures to point at processed audio where ad reads are moved to the end. Episode descriptions are replaced with timestamped, one-sentence overviews of each editorial section, generated from the ad-free transcript with the source description used only when it provides relevant context.
 
 Example:
 

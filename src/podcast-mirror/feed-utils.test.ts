@@ -26,7 +26,12 @@ describe('podcast mirror feed utils', () => {
         const slugC = computeEpisodeSlug('C', 'g3', 3);
 
         const existingItemsBySlug = new Map<string, any>([
-            [slugA, { enclosure: { '@_url': 'mirrored-a' }, guid: 'mirrored-guid-a' }],
+            [slugA, {
+                enclosure: { '@_url': 'mirrored-a' },
+                guid: 'mirrored-guid-a',
+                description: '00:00:00 — Mirrored overview.',
+                'itunes:summary': '00:00:00 — Mirrored overview.',
+            }],
             [slugC, { enclosure: { '@_url': 'mirrored-c' }, guid: 'mirrored-guid-c' }],
         ]);
 
@@ -43,8 +48,9 @@ describe('podcast mirror feed utils', () => {
 
         expect(out.map(i => i.title)).toEqual(['A', 'B', 'C']);
         expect(out[0].enclosure['@_url']).toBe('mirrored-a');
+        expect(out[0].description).toBe('00:00:00 — Mirrored overview.');
+        expect(out[0]['itunes:summary']).toBe('00:00:00 — Mirrored overview.');
         expect(out[1].enclosure['@_url']).toBe('processed-b');
         expect(out[2].enclosure['@_url']).toBe('mirrored-c');
     });
 });
-

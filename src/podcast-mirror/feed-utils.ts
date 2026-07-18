@@ -32,6 +32,9 @@ export function extractEpisodeSlug(enclosureUrl: string, gcsRoot: string): strin
 export function applyMirroredItemFields(targetItem: any, mirroredItem: any): void {
     if (mirroredItem?.enclosure) targetItem.enclosure = mirroredItem.enclosure;
     if (mirroredItem?.guid) targetItem.guid = mirroredItem.guid;
+    if (mirroredItem?.description) targetItem.description = mirroredItem.description;
+    if (mirroredItem?.['itunes:summary']) targetItem['itunes:summary'] = mirroredItem['itunes:summary'];
+    if (mirroredItem?.['content:encoded']) targetItem['content:encoded'] = mirroredItem['content:encoded'];
     if (mirroredItem?.['itunes:duration']) targetItem['itunes:duration'] = mirroredItem['itunes:duration'];
     if (mirroredItem?.['psc:chapters']) targetItem['psc:chapters'] = mirroredItem['psc:chapters'];
     if (mirroredItem?.['podcast:chapters']) targetItem['podcast:chapters'] = mirroredItem['podcast:chapters'];
@@ -74,4 +77,3 @@ export function buildMergedMirrorItems(options: {
 
     return outputItems;
 }
-

@@ -16,11 +16,13 @@ import { FETCH_CONCURRENCY, GCS_BASE_URL, GCS_BUCKET, TTS_SAMPLE_RATE } from './
 import { uploadToGCS } from './upload';
 import { generateJsonChapters } from './output';
 import { classifyAdSegments } from './ai/ad-detection';
+import { generateEpisodeOverview } from './ai/episode-overview';
 import { resolveVoice, DEFAULT_VOICE, VOICE_NAMES, ENGLISH_DIALECTS, type EnglishDialect } from './voice';
 import { gcsClient, ttsClient } from './clients';
 import { applyMirroredItemFields, buildMergedMirrorItems, computeEpisodeSlug, extractEpisodeSlug, slugify } from './podcast-mirror/feed-utils';
 import { isInteractionReminderText } from './podcast-mirror/interaction-reminder';
 import { prefixMirrorText, renderMirrorArtwork } from './podcast-mirror/artwork';
+import { formatEpisodeDescription } from './podcast-mirror/episode-description';
 import { detectSponsorKeywordRanges } from './podcast-mirror/sponsor-detection';
 import type { TranscriptSegment, TranscriptWord } from './types';
 
@@ -111,6 +113,23 @@ function prefixTextNode(node: any): any {
     const text = getText(node);
     if (!text) return node;
     return setText(node, prefixMirrorText(text));
+}
+
+function getSourceEpisodeDescription(item: any): string {
+    const candidates = [
+        getText(item['content:encoded']),
+        getText(item['itunes:summary']),
+        getText(item.description),
+    ].filter(Boolean);
+    return candidates.sort((a, b) => b.length - a.length)[0] ?? '';
+}
+
+function setEpisodeDescription(item: any, description: string): void {
+    item.description = setText(item.description, description);
+    item['itunes:summary'] = setText(item['itunes:summary'], description);
+    if (item['content:encoded']) {
+        item['content:encoded'] = setText(item['content:encoded'], description);
+    }
 }
 
 function parseChapterStart(start: string): number {
@@ -633,6 +652,7 @@ async function applyLocalOutputFields(options: {
     item: any;
     outputAudioPath: string;
     chaptersJsonPath: string;
+    episodeDescriptionPath: string;
     gcsEpisodePath: string;
     episodeSlug: string;
     ext: string;
@@ -643,6 +663,7 @@ async function applyLocalOutputFields(options: {
     const audioUrl = `${GCS_BASE_URL}/${options.gcsEpisodePath}/${options.episodeSlug}.${options.ext}`;
     const chaptersJsonUrl = `${GCS_BASE_URL}/${options.gcsEpisodePath}/${options.episodeSlug}-chapters.json`;
     const existingChapters = await readExistingChapters(options.chaptersJsonPath);
+    const episodeDescription = await readFile(options.episodeDescriptionPath, 'utf-8');
     const chapters = existingChapters ?? [{ title: 'Episode', startMs: 0 }];
     if (!existingChapters) {
         await writeFile(options.chaptersJsonPath, JSON.stringify(generateJsonChapters(chapters, getText(options.item.link)), null, 2), 'utf-8');
@@ -656,6 +677,7 @@ async function applyLocalOutputFields(options: {
     };
 
     options.item.guid = updateGuid(options.item.guid, audioUrl);
+    setEpisodeDescription(options.item, episodeDescription.trim());
     options.item['itunes:duration'] = setText(options.item['itunes:duration'], formatMs(Math.round(outputInfo.durationSec * 1000)));
     options.item['psc:chapters'] = {
         '@_version': '1.2',
@@ -811,9 +833,11 @@ void createScript(async () => {
         const episodeDir = path.join(baseOutputDir, episodeSlug);
         const outputAudioPath = path.join(episodeDir, `${episodeSlug}.${ext}`);
         const chaptersJsonPath = path.join(episodeDir, `${episodeSlug}-chapters.json`);
+        const episodeDescriptionPath = path.join(episodeDir, `${episodeSlug}-description.txt`);
         const gcsEpisodePath = `${gcsRoot}/${episodeSlug}`;
         const alreadyInFeed = existingSlugs.has(episodeSlug);
         let localOutputExists = false;
+        let localDescriptionExists = false;
         try {
             const existingStat = await stat(episodeDir);
             if (existingStat.isDirectory()) {
@@ -822,6 +846,12 @@ void createScript(async () => {
                     localOutputExists = localOutputStat.isFile();
                 } catch {
                     localOutputExists = false;
+                }
+                try {
+                    const localDescriptionStat = await stat(episodeDescriptionPath);
+                    localDescriptionExists = localDescriptionStat.isFile();
+                } catch {
+                    localDescriptionExists = false;
                 }
             }
         } catch {
@@ -841,12 +871,13 @@ void createScript(async () => {
             continue;
         }
 
-        if (localOutputExists) {
+        if (localOutputExists && localDescriptionExists) {
             console.log(chalk.yellow(`  ↷ Reusing existing local output: ${title}`));
             const outputStats = await applyLocalOutputFields({
                 item,
                 outputAudioPath,
                 chaptersJsonPath,
+                episodeDescriptionPath,
                 gcsEpisodePath,
                 episodeSlug,
                 ext,
@@ -863,6 +894,10 @@ void createScript(async () => {
             console.log(chalk.green(`  ✓ ${episodeSlug}.${ext} (${(outputStats.size / 1024 / 1024).toFixed(1)} MB)`));
             console.log();
             continue;
+        }
+
+        if (localOutputExists) {
+            console.log(chalk.gray(`  Regenerating cached episode to add its ad-free description: ${title}`));
         }
 
         await mkdir(episodeDir, { recursive: true });
@@ -950,6 +985,25 @@ void createScript(async () => {
         const adDuration = mergedAdRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
         const interactionReminderDuration = mergedInteractionReminderRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
         const removedDuration = mergedRemovedRanges.reduce((sum, range) => sum + (range.endSec - range.startSec), 0);
+
+        const sourceDescription = getSourceEpisodeDescription(item);
+        const contentSegments = segments.filter(segment => !mergedRemovedRanges.some(range =>
+            segment.startSec < range.endSec && segment.endSec > range.startSec
+        ));
+        console.log(chalk.gray('  Generating ad-free episode overview...'));
+        const overviewSections = await generateEpisodeOverview({
+            title,
+            sourceDescription,
+            segments: contentSegments,
+        });
+        const contentSegmentsByIndex = new Map(contentSegments.map(segment => [segment.index, segment]));
+        const episodeDescription = formatEpisodeDescription(overviewSections.map(section => ({
+            startMs: Math.round(adjustChapterStart(contentSegmentsByIndex.get(section.startSegmentIndex)!.startSec, mergedRemovedRanges) * 1000),
+            summary: section.summary,
+        })));
+        await writeFile(episodeDescriptionPath, episodeDescription, 'utf-8');
+        setEpisodeDescription(item, episodeDescription);
+        console.log(chalk.green(`  Generated ${overviewSections.length} description sections`));
 
         if (mergedRemovedRanges.length === 0) {
             console.log(chalk.yellow('  No ad or interaction-reminder segments detected; mirroring original audio'));
