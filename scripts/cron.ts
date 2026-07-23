@@ -15,6 +15,10 @@ const podcasts = [
         name: 'Huberman Lab',
         feedUrl: 'https://feeds.megaphone.fm/hubermanlab',
     },
+    {
+        name: 'The Diary Of A CEO',
+        feedUrl: 'https://feeds.megaphone.fm/thediaryofaceo',
+    },
 ];
 
 const RECENT_DAYS = 7;
