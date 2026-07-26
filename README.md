@@ -69,9 +69,9 @@ When uploaded (default), also updates the master RSS feed at:
 - `bun run start <url>`: run once
 - `bun run dev`: auto-reload while editing `src/read-to-me.ts`
 
-## Podcast Mirror (Ad Splicing)
+## Podcast Mirror (Ad Removal)
 
-`src/podcast-mirror.ts` mirrors an existing podcast RSS feed into the same GCS bucket, rewriting episode enclosures to point at processed audio where ad reads are moved to the end. Episode descriptions are replaced with timestamped, one-sentence overviews of each editorial section, generated from the ad-free transcript with the source description used only when it provides relevant context.
+`src/podcast-mirror.ts` mirrors an existing podcast RSS feed into the same GCS bucket, rewriting episode enclosures to point at processed audio with ad reads removed. The old end-of-episode ad reel can be restored with `--append-ads`. Episode descriptions are replaced with timestamped, one-sentence overviews of each editorial section, generated from the ad-free transcript with the source description used only when it provides relevant context.
 
 Example:
 

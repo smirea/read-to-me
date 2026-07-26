@@ -7,6 +7,19 @@ export interface SponsorKeywordRange {
 }
 
 const SPONSOR_PHRASES = [
+    ['our', 'sponsor'],
+    ['sponsor', 'of', 'this', 'podcast'],
+    ['sponsored', 'by'],
+    ['brought', 'to', 'you', 'by'],
+    ['support', 'for', 'this', 'podcast', 'comes', 'from'],
+    ['use', 'code'],
+    ['promo', 'code'],
+    ['percent', 'off'],
+    ['dollars', 'off'],
+    ['free', 'trial'],
+    ['free', 'gift'],
+    ['limited', 'time', 'offer'],
+    ['terms', 'apply'],
     ['prescription', 'hair', 'loss'],
     ['hair', 'loss', 'treatments'],
     ['personalized', 'treatment', 'plans'],
@@ -19,9 +32,18 @@ const SPONSOR_PHRASES = [
     ['finasteride'],
 ];
 
+const DECISIVE_SPONSOR_PHRASES = new Set([
+    'our sponsor',
+    'sponsor of this podcast',
+    'sponsored by',
+    'brought to you by',
+    'support for this podcast comes from',
+]);
+
 const GROUP_MAX_GAP_SEC = 90;
-const PAD_BEFORE_SEC = 8;
-const PAD_AFTER_SEC = 4;
+const PAD_BEFORE_SEC = 30;
+const PAD_AFTER_SEC = 10;
+const DECISIVE_SINGLE_HIT_PAD_AFTER_SEC = 45;
 
 interface SponsorHit {
     phrase: string;
@@ -71,10 +93,14 @@ function groupSponsorHits(hits: SponsorHit[], totalDurationSec: number): Sponsor
 
     return groups.flatMap(group => {
         const hasStrongPhrase = group.some(hit => hit.tokenCount > 1);
-        if (group.length < 2 || !hasStrongPhrase) return [];
+        const hasDecisivePhrase = group.some(hit => DECISIVE_SPONSOR_PHRASES.has(hit.phrase));
+        if ((!hasDecisivePhrase && group.length < 2) || !hasStrongPhrase) return [];
 
         const startSec = Math.max(0, group[0].startSec - PAD_BEFORE_SEC);
-        const endSec = Math.min(totalDurationSec, group[group.length - 1].endSec + PAD_AFTER_SEC);
+        const padAfterSec = group.length === 1 && hasDecisivePhrase
+            ? DECISIVE_SINGLE_HIT_PAD_AFTER_SEC
+            : PAD_AFTER_SEC;
+        const endSec = Math.min(totalDurationSec, group[group.length - 1].endSec + padAfterSec);
         if (endSec <= startSec) return [];
 
         return [{

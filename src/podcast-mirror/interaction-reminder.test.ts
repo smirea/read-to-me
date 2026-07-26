@@ -15,6 +15,10 @@ describe('interaction reminder detection', () => {
         expect(isInteractionReminderText('Links are in the show notes, follow us on Instagram')).toBe(true);
     });
 
+    test('detects a private community pitch', () => {
+        expect(isInteractionReminderText('Join our private closed community through the link in the description')).toBe(true);
+    });
+
     test('does not match regular editorial content', () => {
         expect(isInteractionReminderText('The study follows 500 patients over 10 years and reviews every visit.')).toBe(false);
     });

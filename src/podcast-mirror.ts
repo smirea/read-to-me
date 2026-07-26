@@ -28,7 +28,7 @@ import type { TranscriptSegment, TranscriptWord } from './types';
 
 const argv = yargs(hideBin(process.argv))
     .scriptName('podcast-mirror')
-    .usage('$0 <feedUrl>', 'Mirror a podcast feed with ad reads spliced to the end', yargs => {
+    .usage('$0 <feedUrl>', 'Mirror a podcast feed with ads removed', yargs => {
         return yargs.positional('feedUrl', {
             describe: 'URL of the podcast RSS feed',
             type: 'string',
@@ -42,6 +42,16 @@ const argv = yargs(hideBin(process.argv))
     })
     .option('skip-upload', {
         describe: 'Skip uploading to GCS bucket (for testing)',
+        type: 'boolean',
+        default: false,
+    })
+    .option('append-ads', {
+        describe: 'Append removed ad reads to the end of each episode',
+        type: 'boolean',
+        default: false,
+    })
+    .option('force', {
+        describe: 'Reprocess matching episodes even if they are already mirrored',
         type: 'boolean',
         default: false,
     })
@@ -698,6 +708,8 @@ void createScript(async () => {
     const feedUrl = argv.feedUrl as string;
     const outputDir = argv.output ? path.resolve(argv.output) : null;
     const skipUpload = argv['skip-upload'];
+    const appendAds = argv['append-ads'];
+    const force = argv.force;
     const limit = typeof argv.limit === 'number' && argv.limit > 0 ? argv.limit : null;
     const first = typeof argv.first === 'number' && argv.first > 0 ? argv.first : null;
     const last = typeof argv.last === 'number' && argv.last > 0 ? argv.last : null;
@@ -723,6 +735,8 @@ void createScript(async () => {
     console.log(`  Transcription language: ${languageCode}`);
     console.log(`  Output: ${outputDir || '(auto)'}`);
     console.log(`  Upload: ${skipUpload ? 'disabled' : 'enabled'}`);
+    console.log(`  Append removed ads: ${appendAds ? 'enabled' : 'disabled'}`);
+    if (force) console.log('  Force reprocessing: enabled');
     if (limit) console.log(`  Episode limit: ${limit}`);
     if (first) console.log(`  First episodes: ${first}`);
     if (last) console.log(`  Last episodes: ${last}`);
@@ -858,7 +872,7 @@ void createScript(async () => {
             localOutputExists = false;
         }
 
-        if (alreadyInFeed) {
+        if (alreadyInFeed && !force) {
             const mirroredItem = existingMirror.itemsBySlug.get(episodeSlug);
             if (mirroredItem) {
                 applyMirroredItemFields(item, mirroredItem);
@@ -871,7 +885,7 @@ void createScript(async () => {
             continue;
         }
 
-        if (localOutputExists && localDescriptionExists) {
+        if (localOutputExists && localDescriptionExists && !force) {
             console.log(chalk.yellow(`  ↷ Reusing existing local output: ${title}`));
             const outputStats = await applyLocalOutputFields({
                 item,
@@ -1011,6 +1025,7 @@ void createScript(async () => {
         } else {
             if (mergedAdRanges.length > 0) {
                 console.log(chalk.green(`  Detected ${mergedAdRanges.length} ad ranges (${adDuration.toFixed(1)}s)`));
+                console.log(chalk.green(`  ${appendAds ? 'Appending' : 'Discarding'} removed ad reads`));
             }
             if (sponsorKeywordRanges.length > 0) {
                 const hits = sponsorKeywordRanges.flatMap(range => range.hits);
@@ -1036,15 +1051,17 @@ void createScript(async () => {
             }
 
             const adFiles: string[] = [];
-            for (let i = 0; i < mergedAdRanges.length; i++) {
-                const segmentPath = path.join(segmentDir, `ad-${String(i + 1).padStart(3, '0')}.wav`);
-                await extractSegment(originalPath, mergedAdRanges[i], segmentPath, audioInfo.sampleRate, audioInfo.channels);
-                adFiles.push(segmentPath);
+            if (appendAds) {
+                for (let i = 0; i < mergedAdRanges.length; i++) {
+                    const segmentPath = path.join(segmentDir, `ad-${String(i + 1).padStart(3, '0')}.wav`);
+                    await extractSegment(originalPath, mergedAdRanges[i], segmentPath, audioInfo.sampleRate, audioInfo.channels);
+                    adFiles.push(segmentPath);
+                }
             }
 
             const bitRateKbps = Math.max(64, Math.round((audioInfo.bitRate ?? 128000) / 1000));
             const concatOrder = [...keepFiles];
-            if (mergedAdRanges.length > 0) {
+            if (appendAds && mergedAdRanges.length > 0) {
                 const announcementPath = path.join(segmentDir, 'announcement.wav');
                 const announcementText = `starting ${mergedAdRanges.length} spliced ad ${mergedAdRanges.length === 1 ? 'read' : 'reads'}`;
                 await synthesizeAnnouncement(announcementText, announcementPath, audioInfo.sampleRate, audioInfo.channels, voice, dialect);
@@ -1070,7 +1087,7 @@ void createScript(async () => {
             originalChapters,
             mergedRemovedRanges,
             mainDurationSec,
-            mergedAdRanges.length > 0,
+            appendAds && mergedAdRanges.length > 0,
             mergedAdRanges.length,
         );
 

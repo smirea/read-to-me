@@ -7,9 +7,11 @@ const INTERACTION_REMINDER_PATTERNS: RegExp[] = [
     /\bturn on notifications\b/i,
     /\bsmash\s+(?:that\s+)?(?:like|subscribe)\b/i,
     /\bjoin\s+(?:our|the)\s+(?:patreon|substack|newsletter|discord|community)\b/i,
+    /\bjoin\s+(?:our|the)\s+(?:(?:private|closed|close)\s+){0,2}community\b/i,
     /\bsupport\s+(?:the\s+)?(?:show|podcast|us)\s+(?:on\s+)?(?:patreon|substack|paypal|bitcoin|buy me a coffee)\b/i,
     /\bfollow us on\b/i,
     /\blink(?:s)?\s+(?:are|is)\s+in\s+(?:the\s+)?(?:description|show notes)\b/i,
+    /\bhead to\s+(?:the\s+)?link\s+in\s+(?:the\s+)?(?:description|show notes)\b/i,
     /\bshare\s+(?:this|the)\s+(?:show|episode)\b/i,
     /\btell a friend\b/i,
 ];
