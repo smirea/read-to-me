@@ -26,7 +26,7 @@ bun src/read-to-me.ts <url> [options]
 | `--dialect` | `-d` | English dialect | `en-GB` |
 | `--output` | `-o` | Output directory path | auto |
 | `--enhance-speech` | | Enhance text for TTS with SSML | `true` |
-| `--cache-images` | | Cache AI image parsing results (1 week TTL) | `true` |
+| `--cache-images` | | Cache AI image parsing results (1 week TTL) | `false` |
 | `--skip-upload` | | Skip uploading to GCS bucket | `false` |
 
 **Voices:** `Aoede`, `Charon`, `Fenrir`, `Kore`, `Leda`, `Orus`, `Puck`, `Zephyr`, `random`, `random-male`, `random-female`
@@ -78,6 +78,8 @@ Example:
 ```bash
 bun src/podcast-mirror.ts https://example.com/feed.xml --limit 3
 ```
+
+Local processing files use a temporary directory and are deleted after upload. Pass `--cache` to retain them under `output/`, or use `--output` to choose a persistent output directory. `--skip-upload` also retains local output because it is the only result.
 
 Incremental workflow:
 

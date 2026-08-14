@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 import chalk from 'chalk';
 import path from 'path';
-import { mkdir, stat, unlink, writeFile, copyFile, readFile } from 'fs/promises';
+import { rmSync } from 'fs';
+import { mkdir, mkdtemp, rm, stat, unlink, writeFile, copyFile, readFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { XMLParser, XMLBuilder } from 'fast-xml-parser';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
@@ -52,6 +54,11 @@ const argv = yargs(hideBin(process.argv))
     })
     .option('force', {
         describe: 'Reprocess matching episodes even if they are already mirrored',
+        type: 'boolean',
+        default: false,
+    })
+    .option('cache', {
+        describe: 'Keep local processing files when using the automatic output directory',
         type: 'boolean',
         default: false,
     })
@@ -710,6 +717,7 @@ void createScript(async () => {
     const skipUpload = argv['skip-upload'];
     const appendAds = argv['append-ads'];
     const force = argv.force;
+    const cache = argv.cache;
     const limit = typeof argv.limit === 'number' && argv.limit > 0 ? argv.limit : null;
     const first = typeof argv.first === 'number' && argv.first > 0 ? argv.first : null;
     const last = typeof argv.last === 'number' && argv.last > 0 ? argv.last : null;
@@ -735,6 +743,7 @@ void createScript(async () => {
     console.log(`  Transcription language: ${languageCode}`);
     console.log(`  Output: ${outputDir || '(auto)'}`);
     console.log(`  Upload: ${skipUpload ? 'disabled' : 'enabled'}`);
+    console.log(`  Local cache: ${cache ? 'enabled' : 'disabled'}`);
     console.log(`  Append removed ads: ${appendAds ? 'enabled' : 'disabled'}`);
     if (force) console.log('  Force reprocessing: enabled');
     if (limit) console.log(`  Episode limit: ${limit}`);
@@ -821,7 +830,14 @@ void createScript(async () => {
     console.log(`  Processing: ${itemsToProcessCount}`);
     console.log();
 
-    const baseOutputDir = outputDir || path.join(process.cwd(), 'output', mirrorSlug);
+    const temporaryOutputDir = !outputDir && !skipUpload && !cache
+        ? await mkdtemp(path.join(tmpdir(), 'read-to-me-'))
+        : null;
+    if (temporaryOutputDir) {
+        process.once('exit', () => rmSync(temporaryOutputDir, { recursive: true, force: true }));
+    }
+
+    const baseOutputDir = outputDir || temporaryOutputDir || path.join(process.cwd(), 'output', mirrorSlug);
     await mkdir(baseOutputDir, { recursive: true });
     const existingMirror = await fetchExistingMirrorItems(`${gcsFeedUrl}?fresh=${Date.now()}`, gcsRoot);
     for (const item of existingMirror.itemsBySlug.values()) {
@@ -1133,6 +1149,9 @@ void createScript(async () => {
         }
 
         processedSlugs.add(episodeSlug);
+        if (temporaryOutputDir) {
+            await rm(episodeDir, { recursive: true, force: true });
+        }
         console.log(chalk.green(`  ✓ ${episodeSlug}.${ext} (${(outputStats.size / 1024 / 1024).toFixed(1)} MB)`));
         console.log();
     }
@@ -1162,5 +1181,5 @@ void createScript(async () => {
     console.log(style.header('Mirror Complete'));
     console.log(`  Feed title: ${mirrorTitle}`);
     console.log(`  Feed URL: ${gcsFeedUrl}`);
-    console.log(`  Output: ${baseOutputDir}`);
+    console.log(`  Output: ${temporaryOutputDir ? 'not retained' : baseOutputDir}`);
 });

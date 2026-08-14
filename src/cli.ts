@@ -46,7 +46,7 @@ export const argv = yargs(hideBin(process.argv))
     .option('cache-images', {
         describe: 'Cache AI image parsing results (expires in 1 week)',
         type: 'boolean',
-        default: true,
+        default: false,
     })
     .option('enhance-speech', {
         describe: 'Enhance text for better TTS using AI (converts to SSML)',
